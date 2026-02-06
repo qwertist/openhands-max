@@ -953,11 +953,26 @@ class FormulaManager:
             return False
     
     def _save_formula_manual(self, formula: Formula) -> bool:
-        """Save formula without tomli_w."""
+        """Save formula without tomli_w.
+        
+        Uses TOML multiline strings (triple quotes) for descriptions
+        that may contain newlines.
+        """
         formula_file = self.formulas_dir / f"{formula.name}.toml"
         
+        def escape_string(s: str) -> str:
+            """Escape string for TOML, using multiline if needed."""
+            if '\n' in s:
+                # Use multiline literal string (triple single quotes)
+                # Replace any ''' in content to avoid breaking
+                safe = s.replace("'''", "' ' '")
+                return f"'''\n{safe}'''"
+            else:
+                # Simple string with escaped quotes
+                return f'"{s.replace(chr(34), chr(92)+chr(34))}"'
+        
         lines = [
-            f'description = "{formula.description}"',
+            f'description = {escape_string(formula.description)}',
             f'formula = "{formula.name}"',
             f'version = {formula.version}',
             ''
@@ -969,7 +984,7 @@ class FormulaManager:
                 if isinstance(v, bool):
                     lines.append(f'{k} = {str(v).lower()}')
                 elif isinstance(v, str):
-                    lines.append(f'{k} = "{v}"')
+                    lines.append(f'{k} = {escape_string(v)}')
                 else:
                     lines.append(f'{k} = {v}')
             lines.append('')
@@ -977,8 +992,8 @@ class FormulaManager:
         for step in formula.steps:
             lines.append('[[steps]]')
             lines.append(f'id = "{step.id}"')
-            lines.append(f'title = "{step.title}"')
-            lines.append(f'description = "{step.description}"')
+            lines.append(f'title = {escape_string(step.title)}')
+            lines.append(f'description = {escape_string(step.description)}')
             if step.needs:
                 needs_str = ', '.join(f'"{n}"' for n in step.needs)
                 lines.append(f'needs = [{needs_str}]')
