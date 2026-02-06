@@ -334,8 +334,11 @@ def read_config() -> dict:
     # Validate required fields
     if not isinstance(data.get("currentIteration"), int):
         data["currentIteration"] = 0
-    if data.get("status") not in ["running", "paused", "stopped", "complete", "error", "initialized", "starting"]:
-        log_warning(f"Invalid status '{data.get('status')}', resetting to 'paused'")
+    # FIX: Explicit None check for clarity (None not in list is True, but explicit is better)
+    status = data.get("status")
+    valid_statuses = ["running", "paused", "stopped", "complete", "error", "initialized", "starting"]
+    if status is None or status not in valid_statuses:
+        log_warning(f"Invalid status '{status}', resetting to 'paused'")
         data["status"] = "paused"
     
     return data
@@ -985,7 +988,8 @@ class ContextCondenser:
             # Use semantic similarity instead of keyword matching
             similarity = self.semantic.compute_similarity(fact_text, condensed)
             
-            if similarity >= SEMANTIC_CONDENSE_VERIFY:
+            # FIX: Add epsilon for float comparison tolerance
+            if similarity >= SEMANTIC_CONDENSE_VERIFY - 1e-9:
                 preserved += 1
             else:
                 missing.append(fact)
@@ -1122,9 +1126,11 @@ class DivergenceDetector:
                 return True, f"circular_pattern (avg_sim={avg_similarity:.2f})", "force_new_approach"
         
         # Check 2: Same outcome repeating
+        # FIX: Guard against empty list and falsy outcomes
         outcomes = [o['outcome'] for o in outputs[-5:]]
-        if outcomes.count(outcomes[0]) >= 4 and outcomes[0] not in ['task_done', 'verified_pass']:
-            return True, f"repeated_outcome ({outcomes[0]} x{outcomes.count(outcomes[0])})", "escalate_to_architect"
+        if outcomes and outcomes[0]:  # Ensure list is non-empty and first element is truthy
+            if outcomes.count(outcomes[0]) >= 4 and outcomes[0] not in ['task_done', 'verified_pass']:
+                return True, f"repeated_outcome ({outcomes[0]} x{outcomes.count(outcomes[0])})", "escalate_to_architect"
         
         # Check 3: Error patterns
         error_outputs = [o for o in outputs if 'error' in o['outcome'].lower() or 'fail' in o['outcome'].lower()]
@@ -1509,7 +1515,9 @@ class CircuitBreaker:
         if self.state == "CLOSED":
             return True
         if self.state == "OPEN":
-            if time.time() - self.last_failure >= self.timeout:
+            # FIX: Use max(0, ...) to handle clock jumps (NTP sync can make time go backward)
+            elapsed = max(0, time.time() - self.last_failure)
+            if elapsed >= self.timeout:
                 self.state = "HALF_OPEN"
                 self._save_state()
                 return True
