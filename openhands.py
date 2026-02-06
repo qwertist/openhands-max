@@ -787,42 +787,50 @@ def atomic_write(filepath: Path, content: str, backup: bool = True) -> bool:
     """
     Write file atomically to prevent corruption on crash.
     
-    Pattern: write to .tmp file, then rename (atomic on POSIX).
+    FIX: Use tempfile.mkstemp for unpredictable temp file names (prevents symlink attacks).
+    Pattern: write to random temp file, then rename (atomic on POSIX).
     Optionally keeps one backup.
     """
+    import tempfile
     filepath = Path(filepath)
-    tmp_path = filepath.with_suffix(filepath.suffix + '.tmp')
     backup_path = filepath.with_suffix(filepath.suffix + '.bak') if backup else None
     
     try:
-        # Write to temp file
-        tmp_path.write_text(content)
+        # Ensure parent directory exists
+        filepath.parent.mkdir(parents=True, exist_ok=True)
         
-        # Sync to disk
-        with open(tmp_path, 'r', encoding='utf-8') as f:
-            os.fsync(f.fileno())
-        
-        # Backup existing file if requested
-        if backup and filepath.exists():
+        # Create temp file with random name in same directory (for atomic rename)
+        fd, tmp_path = tempfile.mkstemp(dir=filepath.parent, suffix='.tmp')
+        try:
+            # Write content and sync to disk
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            # Backup existing file if requested
+            if backup and filepath.exists():
+                try:
+                    if backup_path.exists():
+                        backup_path.unlink()
+                    filepath.rename(backup_path)
+                except Exception:
+                    pass  # Best effort backup
+            
+            # Atomic rename
+            os.rename(tmp_path, filepath)
+            return True
+            
+        except Exception:
+            # Cleanup temp file on error
             try:
-                if backup_path.exists():
-                    backup_path.unlink()
-                filepath.rename(backup_path)
+                os.unlink(tmp_path)
             except Exception:
-                pass  # Best effort backup
-        
-        # Atomic rename
-        tmp_path.rename(filepath)
-        return True
+                pass
+            raise
         
     except Exception as e:
         log_error(f"Atomic write failed for {filepath}: {e}")
-        # Cleanup temp file
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except Exception:
-            pass
         return False
 
 
@@ -869,11 +877,13 @@ def safe_append_text(filepath: Path, content: str) -> bool:
         return False
 
 
-def safe_read_json(filepath: Path, default: Any = None) -> Any:
+def safe_read_json(filepath: Path, default: Any = None, max_size: int = 50_000_000) -> Any:
     """
-    Safely read JSON file with corruption recovery.
+    Safely read JSON file with corruption recovery and size limit.
     
     Falls back to .bak file if main file is corrupted.
+    
+    FIX: Added max_size check to prevent OOM on huge/corrupted files.
     """
     filepath = Path(filepath)
     backup_path = filepath.with_suffix(filepath.suffix + '.bak')
@@ -881,6 +891,12 @@ def safe_read_json(filepath: Path, default: Any = None) -> Any:
     # Try main file
     if filepath.exists():
         try:
+            # Check file size first to prevent OOM
+            size = filepath.stat().st_size
+            if size > max_size:
+                log_error(f"File too large: {filepath} ({size} bytes, max {max_size})")
+                return default
+            
             content = filepath.read_text()
             return json.loads(content)
         except json.JSONDecodeError as e:

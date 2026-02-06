@@ -145,6 +145,7 @@ MAX_CONSECUTIVE_ERRORS = 5
 # Daemon state
 shutdown_requested = False
 current_process = None
+_process_lock = None  # Initialized in main() to avoid import-time threading issues
 
 
 # =============================================================================
@@ -180,24 +181,43 @@ def log_debug(message: str):
 # =============================================================================
 
 def atomic_write_text(filepath: Path, content: str) -> bool:
-    """Write text atomically, preserving ownership."""
+    """Write text atomically using tempfile for security.
+    
+    FIX: Use tempfile.mkstemp for unpredictable temp file names (prevents symlink attacks).
+    FIX: Use 0o644 instead of 0o666 for better security.
+    """
+    import tempfile
     filepath = Path(filepath)
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.chmod(filepath.parent, 0o777)
+            os.chmod(filepath.parent, 0o755)  # rwxr-xr-x instead of 0o777
         except Exception:
             pass
         
-        file_existed = filepath.exists()
-        filepath.write_text(content)
-        
-        if not file_existed:
+        # Create temp file with random name in same directory
+        fd, tmp_path = tempfile.mkstemp(dir=filepath.parent, suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            # Atomic rename
+            os.rename(tmp_path, filepath)
+            
             try:
-                os.chmod(filepath, 0o666)
+                os.chmod(filepath, 0o644)  # rw-r--r-- instead of 0o666
             except Exception:
                 pass
-        return True
+            return True
+        except Exception:
+            # Clean up temp file on error
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
     except Exception as e:
         log_error(f"Write failed for {filepath}: {e}")
         return False
@@ -208,11 +228,19 @@ def atomic_write_json(filepath: Path, data: dict) -> bool:
     return atomic_write_text(filepath, json.dumps(data, indent=2, ensure_ascii=False))
 
 
-def safe_read_json(filepath: Path, default: Any = None) -> Any:
-    """Safely read JSON with fallback."""
+def safe_read_json(filepath: Path, default: Any = None, max_size: int = 50_000_000) -> Any:
+    """Safely read JSON with fallback and size limit.
+    
+    FIX: Added max_size check to prevent OOM on corrupted/huge files.
+    """
     if not filepath.exists():
         return default
     try:
+        # Check file size before reading to prevent OOM
+        size = filepath.stat().st_size
+        if size > max_size:
+            log_error(f"File too large: {filepath} ({size} bytes, max {max_size})")
+            return default
         return json.loads(filepath.read_text())
     except Exception:
         return default
@@ -223,18 +251,30 @@ def safe_read_json(filepath: Path, default: Any = None) -> Any:
 # =============================================================================
 
 def signal_handler(signum, frame):
-    """Handle SIGTERM/SIGINT for graceful shutdown."""
-    global shutdown_requested, current_process
+    """Handle SIGTERM/SIGINT for graceful shutdown.
+    
+    FIX: Use lock to safely access current_process from signal handler.
+    """
+    global shutdown_requested, current_process, _process_lock
     log(f"Received signal {signum}, shutting down...")
     shutdown_requested = True
-    if current_process and current_process.poll() is None:
+    
+    # Safely get process reference with lock
+    proc = None
+    if _process_lock:
+        with _process_lock:
+            proc = current_process
+    else:
+        proc = current_process
+    
+    if proc and proc.poll() is None:
         log("Terminating current iteration...")
-        current_process.terminate()
+        proc.terminate()
         try:
-            current_process.wait(timeout=15)
+            proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            current_process.kill()
-            current_process.wait()
+            proc.kill()
+            proc.wait()
 
 
 def write_heartbeat():
@@ -261,7 +301,21 @@ def add_progress(iteration: int, message: str):
 
 
 def read_config() -> dict:
-    return safe_read_json(CONFIG_FILE, {"status": "paused"})
+    """Read config with validation to prevent infinite loops on corruption.
+    
+    FIX: Validate config fields to prevent daemon spin on corrupted data.
+    """
+    default = {"status": "paused", "currentIteration": 0}
+    data = safe_read_json(CONFIG_FILE, default)
+    
+    # Validate required fields
+    if not isinstance(data.get("currentIteration"), int):
+        data["currentIteration"] = 0
+    if data.get("status") not in ["running", "paused", "stopped", "complete", "error", "initialized", "starting"]:
+        log_warning(f"Invalid status '{data.get('status')}', resetting to 'paused'")
+        data["status"] = "paused"
+    
+    return data
 
 
 def save_config(config: dict):
@@ -1849,25 +1903,42 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
     
     try:
         with open(output_file, "w") as f:
-            current_process = subprocess.Popen(
+            # FIX: Use lock when setting current_process for thread-safe signal handling
+            proc = subprocess.Popen(
                 ["bash", "-c", cmd],
                 stdout=f,
                 stderr=subprocess.STDOUT,
                 cwd="/workspace"
             )
+            if _process_lock:
+                with _process_lock:
+                    global current_process
+                    current_process = proc
+            else:
+                current_process = proc
             
             # SECURITY FIX: Cap timeout at DOCKER_TIMEOUT (8 hours) to prevent
             # unbounded wait if config is missing or corrupt
             timeout = min(config.get("sessionTimeoutSeconds", 1800), DOCKER_TIMEOUT)
             try:
-                exit_code = current_process.wait(timeout=timeout)
+                exit_code = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 log_warning(f"Timeout after {timeout}s")
-                current_process.terminate()
-                current_process.wait(timeout=10)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    # FIX: Force kill if terminate doesn't work
+                    proc.kill()
+                    proc.wait()
                 return False, "timeout"
         
-        current_process = None
+        # FIX: Clear current_process with lock
+        if _process_lock:
+            with _process_lock:
+                current_process = None
+        else:
+            current_process = None
         elapsed = time.time() - start_time
         
         output = output_file.read_text() if output_file.exists() else ""
@@ -1924,7 +1995,13 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
     except Exception as e:
         log_error(f"Iteration failed: {e}")
         log_error(traceback.format_exc())
-        current_process = None
+        
+        # FIX: Clear current_process with lock
+        if _process_lock:
+            with _process_lock:
+                current_process = None
+        else:
+            current_process = None
         
         if metrics:
             metrics.record_iteration(False, 0)
@@ -1936,7 +2013,11 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
 
 def main():
     """Main daemon loop."""
-    global shutdown_requested
+    global shutdown_requested, _process_lock
+    import threading
+    
+    # FIX: Initialize process lock for thread-safe signal handling
+    _process_lock = threading.Lock()
     
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
