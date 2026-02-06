@@ -74,7 +74,16 @@ install_dependencies()
 # =============================================================================
 
 # HIGH PRIORITY FIX: Use env var with fallback instead of hardcoded path
-RALPH_DIR = Path(os.environ.get("RALPH_DIR", "/workspace/.ralph"))
+# SECURITY FIX: Validate RALPH_DIR is within allowed directory
+_ralph_dir_raw = Path(os.environ.get("RALPH_DIR", "/workspace/.ralph")).resolve()
+_allowed_base = Path("/workspace").resolve()
+try:
+    _ralph_dir_raw.relative_to(_allowed_base)
+    RALPH_DIR = _ralph_dir_raw
+except ValueError:
+    print(f"SECURITY ERROR: RALPH_DIR must be within /workspace, got: {_ralph_dir_raw}", file=sys.stderr)
+    sys.exit(1)
+
 CONFIG_FILE = RALPH_DIR / "config.json"
 PRD_FILE = RALPH_DIR / "prd.json"
 MISSION_FILE = RALPH_DIR / "MISSION.md"
@@ -191,11 +200,23 @@ def atomic_write_text(filepath: Path, content: str) -> bool:
     FIX: Use tempfile.mkstemp for unpredictable temp file names (prevents symlink attacks).
     FIX: Use 0o644 instead of 0o666 for better security.
     FIX: Properly handle FD leak if os.fdopen fails.
+    FIX: Check for symlink attacks before writing.
     """
     import tempfile
     filepath = Path(filepath)
     fd = None
     tmp_path = None
+    
+    # SECURITY FIX: Prevent symlink attacks
+    if filepath.is_symlink():
+        log_error(f"Security: Refusing to write to symlink: {filepath}")
+        return False
+    
+    # SECURITY FIX: Check parent isn't a symlink
+    if filepath.parent.is_symlink():
+        log_error(f"Security: Parent directory is symlink: {filepath.parent}")
+        return False
+    
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -304,7 +325,7 @@ def write_heartbeat():
     """Write heartbeat timestamp."""
     try:
         HEARTBEAT_FILE.write_text(str(int(time.time())))
-        os.chmod(HEARTBEAT_FILE, 0o666)
+        os.chmod(HEARTBEAT_FILE, 0o644)  # SECURITY: was 0o666
     except Exception:
         pass
 
@@ -553,7 +574,7 @@ class HierarchicalMemory:
     def _save(self, filepath: Path, data: List):
         try:
             filepath.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-            os.chmod(filepath, 0o666)
+            os.chmod(filepath, 0o644)  # SECURITY: was 0o666
         except Exception as e:
             log_error(f"Failed to save {filepath}: {e}")
     
@@ -810,7 +831,7 @@ class LearningsManager:
         
         try:
             LEARNINGS_FILE.write_text(content)
-            os.chmod(LEARNINGS_FILE, 0o666)
+            os.chmod(LEARNINGS_FILE, 0o644)  # SECURITY: was 0o666
         except Exception as e:
             log_error(f"Failed to save learnings: {e}")
     
@@ -1032,7 +1053,7 @@ class ContextCondenser:
         
         try:
             CONDENSED_FILE.write_text(header + condensed)
-            os.chmod(CONDENSED_FILE, 0o666)
+            os.chmod(CONDENSED_FILE, 0o644)  # SECURITY: was 0o666
             self._save_state(iteration)
             log(f"Saved condensed: {len(condensed)} chars")
         except Exception as e:
