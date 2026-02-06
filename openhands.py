@@ -3612,7 +3612,7 @@ class SemanticSearch:
         With 10K cache entries, birthday paradox gives ~0.3% collision rate
         for 64-bit hashes. Full SHA256 has negligible collision probability.
         """
-        import hashlib
+        # hashlib imported at module level
         return hashlib.sha256(text.encode()).hexdigest()
     
     def _get_embedding(self, text: str):
@@ -4020,7 +4020,9 @@ class RalphMetrics:
         mid = len(sizes) // 2
         first_half = sum(sizes[:mid]) / mid
         second_half = sum(sizes[mid:]) / (len(sizes) - mid)
-        if first_half == 0:
+        # FIX: Use epsilon comparison to avoid division by very small numbers
+        # that could cause astronomical growth rates in early iterations
+        if first_half < 1e-9:
             return 0.0
         return (second_half - first_half) / first_half
     
