@@ -142,8 +142,13 @@ MAX_RETRIES = 3
 BASE_DELAY = 30
 MAX_CONSECUTIVE_ERRORS = 5
 
+# Container timeout (used to cap session timeout for safety)
+DOCKER_TIMEOUT = 28800  # 8 hours maximum
+
 # Daemon state
-shutdown_requested = False
+# FIX: Use threading.Event for thread-safe shutdown signaling (instead of raw bool)
+import threading
+_shutdown_event = threading.Event()
 current_process = None
 _process_lock = None  # Initialized in main() to avoid import-time threading issues
 
@@ -185,9 +190,12 @@ def atomic_write_text(filepath: Path, content: str) -> bool:
     
     FIX: Use tempfile.mkstemp for unpredictable temp file names (prevents symlink attacks).
     FIX: Use 0o644 instead of 0o666 for better security.
+    FIX: Properly handle FD leak if os.fdopen fails.
     """
     import tempfile
     filepath = Path(filepath)
+    fd = None
+    tmp_path = None
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -199,12 +207,14 @@ def atomic_write_text(filepath: Path, content: str) -> bool:
         fd, tmp_path = tempfile.mkstemp(dir=filepath.parent, suffix='.tmp')
         try:
             with os.fdopen(fd, 'w') as f:
+                fd = None  # os.fdopen takes ownership of fd
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
             
             # Atomic rename
             os.rename(tmp_path, filepath)
+            tmp_path = None  # Successfully renamed
             
             try:
                 os.chmod(filepath, 0o644)  # rw-r--r-- instead of 0o666
@@ -212,13 +222,19 @@ def atomic_write_text(filepath: Path, content: str) -> bool:
                 pass
             return True
         except Exception:
-            # Clean up temp file on error
+            raise
+    except Exception as e:
+        # Clean up on error
+        if fd is not None:
+            try:
+                os.close(fd)  # FIX: Close FD if os.fdopen didn't take ownership
+            except Exception:
+                pass
+        if tmp_path is not None:
             try:
                 os.unlink(tmp_path)
             except Exception:
                 pass
-            raise
-    except Exception as e:
         log_error(f"Write failed for {filepath}: {e}")
         return False
 
@@ -231,17 +247,18 @@ def atomic_write_json(filepath: Path, data: dict) -> bool:
 def safe_read_json(filepath: Path, default: Any = None, max_size: int = 50_000_000) -> Any:
     """Safely read JSON with fallback and size limit.
     
-    FIX: Added max_size check to prevent OOM on corrupted/huge files.
+    FIX: Read file first, then check size to avoid TOCTOU race condition
+    (file could be swapped between stat and read).
     """
     if not filepath.exists():
         return default
     try:
-        # Check file size before reading to prevent OOM
-        size = filepath.stat().st_size
-        if size > max_size:
-            log_error(f"File too large: {filepath} ({size} bytes, max {max_size})")
+        # Read file first, then check size (avoids TOCTOU race)
+        content = filepath.read_bytes()
+        if len(content) > max_size:
+            log_error(f"File too large: {filepath} ({len(content)} bytes, max {max_size})")
             return default
-        return json.loads(filepath.read_text())
+        return json.loads(content.decode('utf-8'))
     except Exception:
         return default
 
@@ -253,13 +270,14 @@ def safe_read_json(filepath: Path, default: Any = None, max_size: int = 50_000_0
 def signal_handler(signum, frame):
     """Handle SIGTERM/SIGINT for graceful shutdown.
     
+    FIX: Use threading.Event for thread-safe shutdown signaling.
     FIX: Use lock to safely access current_process from signal handler.
     FIX: Don't wait in signal handler - just terminate and let main loop handle cleanup.
     This prevents potential deadlock if main thread is also waiting on the process.
     """
-    global shutdown_requested, current_process, _process_lock
+    global current_process, _process_lock
     log(f"Received signal {signum}, shutting down...")
-    shutdown_requested = True
+    _shutdown_event.set()  # Thread-safe shutdown signal
     
     # Safely get and clear process reference with lock
     proc = None
@@ -277,7 +295,7 @@ def signal_handler(signum, frame):
             if proc.poll() is None:
                 log("Terminating current iteration...")
                 proc.terminate()
-                # Don't wait here - main loop will detect shutdown_requested
+                # Don't wait here - main loop will detect _shutdown_event
         except Exception:
             pass
 
@@ -431,7 +449,9 @@ class SemanticSearch:
             pass
     
     def _text_hash(self, text: str) -> str:
-        return hashlib.md5(text.encode()).hexdigest()[:16]
+        # FIX: Use full SHA256 instead of truncated MD5 to avoid cache key collisions
+        # (MD5[:16] = 64 bits has non-negligible collision probability with 8000 entries)
+        return hashlib.sha256(text.encode()).hexdigest()
     
     def _get_embedding(self, text: str):
         """Get embedding with O(1) LRU cache using OrderedDict.
@@ -558,7 +578,10 @@ class HierarchicalMemory:
         self._save(self.hot_file, hot)
     
     def _add_to_warm(self, entry: dict):
-        """Move to warm tier with compression."""
+        """Move to warm tier with compression.
+        
+        FIX: Batch cold promotions to avoid O(n) file I/O operations.
+        """
         warm = self._load(self.warm_file)
         warm_entry = {
             'iteration': entry['iteration'],
@@ -570,9 +593,14 @@ class HierarchicalMemory:
         }
         warm.append(warm_entry)
         
+        # Collect all entries to promote to cold in one batch
+        cold_promotions = []
         while len(warm) > MAX_WARM_MEMORY:
-            old = warm.pop(0)
-            self._add_to_cold(old)
+            cold_promotions.append(warm.pop(0))
+        
+        # Batch update cold storage (single file I/O instead of O(n))
+        if cold_promotions:
+            self._batch_add_to_cold(cold_promotions)
         
         self._save(self.warm_file, warm)
     
@@ -588,6 +616,30 @@ class HierarchicalMemory:
         outcome = entry.get('outcome', '')
         if outcome and outcome not in ['working', 'unknown'] and outcome not in cold:
             cold.append(f"[{entry['task_id']}] {outcome}")
+        
+        # Deduplicate cold storage
+        cold = list(dict.fromkeys(cold))[-MAX_COLD_MEMORY:]
+        self._save(self.cold_file, cold)
+    
+    def _batch_add_to_cold(self, entries: List[dict]):
+        """Batch add multiple entries to cold storage (single file I/O).
+        
+        FIX: More efficient than calling _add_to_cold() for each entry.
+        """
+        if not entries:
+            return
+        
+        cold = self._load(self.cold_file)
+        
+        for entry in entries:
+            for point in entry.get('key_points', []):
+                if point and point not in cold:
+                    cold.append(point)
+            
+            # Add outcome as key point if significant
+            outcome = entry.get('outcome', '')
+            if outcome and outcome not in ['working', 'unknown'] and outcome not in cold:
+                cold.append(f"[{entry['task_id']}] {outcome}")
         
         # Deduplicate cold storage
         cold = list(dict.fromkeys(cold))[-MAX_COLD_MEMORY:]
@@ -1018,14 +1070,16 @@ class DivergenceDetector:
         self.history_file = RALPH_DIR / "divergence_history.json"
         self.recent_outputs: deque = deque(maxlen=DIVERGENCE_CHECK_WINDOW)
     
-    def record_iteration(self, iteration: int, output_summary: str, outcome: str):
-        """Record iteration for pattern detection."""
-        self.recent_outputs.append({
+    def record_iteration(self, iteration: int, output_summary: str, outcome: str) -> dict:
+        """Record iteration for pattern detection. Returns the entry for later updates."""
+        entry = {
             'iteration': iteration,
             'summary': output_summary[:1000],
             'outcome': outcome,
             'timestamp': datetime.now().isoformat()
-        })
+        }
+        self.recent_outputs.append(entry)
+        return entry
     
     def check_divergence(self) -> Tuple[bool, str, str]:
         """
@@ -1172,18 +1226,19 @@ class AdaptiveContext:
             return content[:budget]
         
         # Score sections by relevance
+        # FIX: Use enumerate to preserve indices correctly (avoids bug with duplicate sections)
         similarities = self.semantic.batch_similarities(query, sections)
-        scored = list(zip(sections, similarities))
-        scored.sort(key=lambda x: x[1], reverse=True)
+        scored = [(i, section, sim) for i, (section, sim) in enumerate(zip(sections, similarities))]
+        scored.sort(key=lambda x: x[2], reverse=True)  # Sort by similarity
         
         # Build result
         result = []
         chars = 0
         
-        for section, score in scored:
+        for idx, section, score in scored:
             if chars + len(section) > budget:
                 continue
-            result.append((sections.index(section), section))  # Keep original order
+            result.append((idx, section))  # Keep original index
             chars += len(section)
         
         # Sort by original order
@@ -1840,10 +1895,11 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
         for learning in tags["learnings"]:
             learnings_mgr.add(learning, iteration)
     
-    # Record in divergence detector
+    # Record in divergence detector - store reference for later update
+    divergence_entry = None
     if divergence_detector:
         summary = output[:500] if len(output) > 500 else output
-        divergence_detector.record_iteration(iteration, summary, result)
+        divergence_entry = divergence_detector.record_iteration(iteration, summary, result)
     
     # Handle by type
     if iter_type == "task_verify":
@@ -1905,7 +1961,7 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
     
     elif iter_type == "architect":
         # FIX: Track last architect iteration to prevent duplicate on resume
-        iteration = config.get("currentIteration", 0)
+        # NOTE: Use the iteration parameter, not config value (which is not yet persisted)
         update_config("lastArchitectIteration", iteration)
         result = "architect_done"
     
@@ -1922,8 +1978,9 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
             result = "condense_done"
     
     # Update divergence detector with final result
-    if divergence_detector:
-        divergence_detector.recent_outputs[-1]['outcome'] = result
+    # FIX: Use stored reference instead of fragile [-1] access
+    if divergence_entry is not None:
+        divergence_entry['outcome'] = result
     
     return result
 
@@ -2001,9 +2058,10 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
                 stderr=subprocess.STDOUT,
                 cwd="/workspace"
             )
+            # FIX: Removed redundant 'global current_process' from nested block
+            # (already declared at function level)
             if _process_lock:
                 with _process_lock:
-                    global current_process
                     current_process = proc
             else:
                 current_process = proc
@@ -2012,7 +2070,7 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
             # unbounded wait if config is missing or corrupt
             timeout = min(config.get("sessionTimeoutSeconds", 1800), DOCKER_TIMEOUT)
             try:
-                exit_code = proc.wait(timeout=timeout)
+                proc.wait(timeout=timeout)  # FIX: Removed unused exit_code assignment
             except subprocess.TimeoutExpired:
                 log_warning(f"Timeout after {timeout}s")
                 proc.terminate()
@@ -2108,8 +2166,7 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
 
 def main():
     """Main daemon loop."""
-    global shutdown_requested, _process_lock
-    import threading
+    global _process_lock
     
     # FIX: Initialize process lock for thread-safe signal handling
     _process_lock = threading.Lock()
@@ -2118,10 +2175,11 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     
     # Ensure directories
+    # FIX: Use 0o755 instead of 0o777 for better security (owner rwx, group/other rx)
     for d in [RALPH_DIR, ITERATIONS_DIR, MEMORY_DIR]:
         d.mkdir(parents=True, exist_ok=True)
         try:
-            os.chmod(d, 0o777)
+            os.chmod(d, 0o755)
         except Exception:
             pass
     
@@ -2142,7 +2200,7 @@ def main():
     iteration_times: deque = deque(maxlen=60)  # Last 60 iteration timestamps
     
     try:
-        while not shutdown_requested:
+        while not _shutdown_event.is_set():
             write_heartbeat()
             
             config = read_config()
