@@ -580,6 +580,22 @@ for server in $servers; do
         continue
     fi
     
+    # HIGH-SEC-004 FIX: Validate command against allowlist to prevent config injection
+    # Only allow known safe executables for MCP servers
+    case "$cmd" in
+        uvx|npx|python|python3|node|deno|bun|cargo|pipx)
+            # Known safe MCP server launchers
+            ;;
+        /usr/bin/python*|/usr/local/bin/python*|/usr/bin/node|/usr/local/bin/node)
+            # Absolute paths to known interpreters
+            ;;
+        *)
+            echo "HIGH-SEC-004: Skipping $server - unknown command: $cmd (not in allowlist)"
+            echo "Allowed: uvx, npx, python, python3, node, deno, bun, cargo, pipx"
+            continue
+            ;;
+    esac
+    
     echo "Starting $server on port $port: $cmd $args"
     
     full_cmd="$cmd $args"
@@ -1133,15 +1149,33 @@ def atomic_write(filepath: Path, content: str, backup: bool = True) -> bool:
         return False
 
 
-def safe_write_text(filepath: Path, content: str, backup: bool = False) -> bool:
+def safe_write_text(filepath: Path, content: str, backup: bool = False, 
+                    raise_on_error: bool = False) -> bool:
     """
     Safely write text file.
     
     Uses atomic write for safety. If permission denied (file owned by root 
     from Docker), logs warning and returns False - caller should handle gracefully.
     
+    RELIABILITY FIX: Added raise_on_error parameter. Critical callers should use
+    raise_on_error=True to ensure they don't silently lose data.
+    
     Note: To avoid permission issues, host should create all workspace/.ralph/ 
     files BEFORE starting daemon. Daemon preserves ownership when updating.
+    
+    Args:
+        filepath: Path to write
+        content: Content to write
+        backup: Whether to backup existing file
+        raise_on_error: If True, raise exception on failure instead of returning False
+                       Use this for critical writes where data loss is unacceptable.
+    
+    Returns:
+        True on success, False on failure (unless raise_on_error=True)
+    
+    Raises:
+        PermissionError: If raise_on_error=True and permission denied
+        Exception: If raise_on_error=True and other errors occur
     """
     filepath = Path(filepath)
     
@@ -1150,13 +1184,17 @@ def safe_write_text(filepath: Path, content: str, backup: bool = False) -> bool:
     
     try:
         return atomic_write(filepath, content, backup=backup)
-    except PermissionError:
+    except PermissionError as e:
         # File owned by root (created in Docker) - can't write without sudo
         # Log warning but don't crash - this is expected if host didn't pre-create files
         log_error(f"Permission denied writing {filepath} (owned by root from Docker)")
+        if raise_on_error:
+            raise
         return False
     except Exception as e:
         log_error(f"Failed to write {filepath}: {e}")
+        if raise_on_error:
+            raise
         return False
 
 
@@ -1264,10 +1302,13 @@ class CircuitBreaker:
         except Exception:
             return {}
     
-    def _save_state(self):
-        """Persist state to file."""
+    def _save_state(self) -> bool:
+        """Persist state to file.
+        
+        HIGH-REL-002 FIX: Returns success status so callers can rollback on failure.
+        """
         if not self.state_file:
-            return
+            return True  # No persistence configured, always "succeeds"
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             state = {
@@ -1277,8 +1318,10 @@ class CircuitBreaker:
                 'last_failure_time': self.last_failure_time
             }
             self.state_file.write_text(json.dumps(state))
-        except Exception:
-            pass  # Best effort
+            return True
+        except Exception as e:
+            log_error(f"Circuit {self.name}: state persistence failed: {e}")
+            return False
     
     def can_proceed(self) -> bool:
         """Check if request can proceed."""
@@ -1307,7 +1350,15 @@ class CircuitBreaker:
         return True
     
     def record_success(self):
-        """Record successful call."""
+        """Record successful call.
+        
+        HIGH-REL-002 FIX: Rollback state changes if persistence fails.
+        """
+        # Save old state for potential rollback
+        old_failures = self.failures
+        old_state = self.state
+        old_successes = self.successes_in_half_open
+        
         state_changed = False
         if self.state == "HALF_OPEN":
             self.successes_in_half_open += 1
@@ -1322,25 +1373,48 @@ class CircuitBreaker:
             self.failures = 0
         
         if state_changed:
-            self._save_state()
+            if not self._save_state():
+                # HIGH-REL-002: Rollback on persistence failure
+                self.failures = old_failures
+                self.state = old_state
+                self.successes_in_half_open = old_successes
+                log_error(f"Circuit {self.name}: state update rolled back due to persistence failure")
     
     def record_failure(self, error: str = ""):
-        """Record failed call."""
+        """Record failed call.
+        
+        HIGH-REL-002 FIX: Rollback state changes if persistence fails.
+        """
+        # Save old state for potential rollback
+        old_failures = self.failures
+        old_state = self.state
+        old_last_failure = self.last_failure_time
+        
         self.last_failure_time = time.time()
         
         # FIX: In HALF_OPEN, immediately go to OPEN on any failure (don't increment counter)
         if self.state == "HALF_OPEN":
             self.state = "OPEN"
             log(f"Circuit {self.name}: HALF_OPEN -> OPEN (still failing: {error[:100]})")
-            self._save_state()
+            if not self._save_state():
+                # HIGH-REL-002: Rollback on persistence failure
+                self.state = old_state
+                self.last_failure_time = old_last_failure
             return
         
         self.failures += 1
+        state_changed = False
         if self.failures >= self.failure_threshold:
             self.state = "OPEN"
+            state_changed = True
             log(f"Circuit {self.name}: CLOSED -> OPEN (threshold reached: {error[:100]})")
         
-        self._save_state()
+        if not self._save_state():
+            # HIGH-REL-002: Rollback on persistence failure
+            self.failures = old_failures
+            self.state = old_state
+            self.last_failure_time = old_last_failure
+            log_error(f"Circuit {self.name}: state update rolled back due to persistence failure")
     
     def get_state(self) -> dict:
         return {
@@ -1576,12 +1650,36 @@ class NotificationManager:
     
     def __init__(self, ralph_dir: Path = None):
         self.ralph_dir = ralph_dir
-        self.config = self._load_config()
+        self._config_cache = None  # HIGH-SEC-002: Lazy load config
+        self._config_cache_time = 0
+        self._config_ttl = 60  # Reload config every 60 seconds
         self._last_notification = {}  # Rate limiting
         self._min_interval = 300  # Min 5 minutes between same type
     
+    @property
+    def config(self) -> dict:
+        """HIGH-SEC-002 FIX: Lazy-load config on demand instead of storing tokens in memory.
+        
+        Tokens are loaded fresh each time (with short TTL cache) to minimize
+        exposure window. This also allows token rotation without restart.
+        """
+        now = time.time()
+        if self._config_cache is None or (now - self._config_cache_time) > self._config_ttl:
+            self._config_cache = self._load_config()
+            self._config_cache_time = now
+        return self._config_cache
+    
+    def clear_credentials(self):
+        """HIGH-SEC-002 FIX: Explicitly clear cached credentials from memory."""
+        self._config_cache = None
+        self._config_cache_time = 0
+    
     def _load_config(self) -> dict:
-        """Load notification config from env or file."""
+        """Load notification config from env or file.
+        
+        HIGH-SEC-002 NOTE: This is called on-demand, not at startup.
+        Credentials are not stored longer than necessary.
+        """
         config = {
             "telegram_bot_token": os.environ.get("RALPH_TELEGRAM_TOKEN"),
             "telegram_chat_id": os.environ.get("RALPH_TELEGRAM_CHAT"),
@@ -5481,8 +5579,27 @@ class Docker:
     TIMEOUT_NORMAL = 60     # Standard operations
     TIMEOUT_INSTALL = 600   # Package installs, builds
     
+    # Pattern for redacting potential secrets in output (HIGH-SEC-001 fix)
+    _SECRET_PATTERN = re.compile(
+        r'(?i)(api[_-]?key|password|passwd|secret|token|auth|credential|bearer)\s*[=:]\s*["\']?([^\s"\']{4})[^\s"\']*',
+        re.IGNORECASE
+    )
+    
     @staticmethod
-    def exec_in_container(name: str, command: str, timeout: int = 60) -> Tuple[int, str]:
+    def _redact_secrets(output: str) -> str:
+        """Redact potential secrets from output to prevent credential logging.
+        
+        HIGH-SEC-001 FIX: Prevents accidental logging of API keys, passwords, etc.
+        """
+        def replacer(match):
+            key = match.group(1)
+            prefix = match.group(2)  # Keep first 4 chars for debugging
+            return f"{key}={prefix}***REDACTED***"
+        return Docker._SECRET_PATTERN.sub(replacer, output)
+    
+    @staticmethod
+    def exec_in_container(name: str, command: str, timeout: int = 60,
+                          sensitive: bool = False) -> Tuple[int, str]:
         """Execute command in container.
         
         SECURITY WARNING: This method executes shell commands. For user-provided
@@ -5490,13 +5607,21 @@ class Docker:
         
         Use timeout presets: Docker.TIMEOUT_QUICK (10s), Docker.TIMEOUT_NORMAL (60s),
         Docker.TIMEOUT_INSTALL (600s) for appropriate operations.
+        
+        HIGH-SEC-001 FIX: When sensitive=True, output is scanned and secrets are redacted
+        to prevent credential logging. Always set sensitive=True for commands that may
+        output environment variables, config files, or API responses.
         """
         try:
             result = subprocess.run(
                 ["docker", "exec", name, "bash", "-c", command],
                 capture_output=True, text=True, timeout=timeout
             )
-            return result.returncode, result.stdout + result.stderr
+            output = result.stdout + result.stderr
+            # HIGH-SEC-001: Redact secrets from output
+            if sensitive:
+                output = Docker._redact_secrets(output)
+            return result.returncode, output
         except subprocess.TimeoutExpired:
             return -1, "Timeout"
         except Exception as e:
@@ -6521,13 +6646,23 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
         return code == 0
     
     @staticmethod
-    def mkdir(container: str, path: str) -> bool:
-        """Create directory in container."""
+    def mkdir(container: str, path: str, mode: str = "755") -> bool:
+        """Create directory in container with explicit permissions.
+        
+        HIGH-SEC-003 FIX: Files created via Docker exec have root ownership.
+        This method now sets explicit permissions to prevent overly permissive defaults.
+        
+        Args:
+            container: Container name
+            path: Directory path to create
+            mode: Unix permission mode (default: 755). Use "700" for sensitive dirs.
+        """
         # SECURITY FIX: Use shlex.quote for path
         quoted_path = shlex.quote(path)
+        # HIGH-SEC-003: Set explicit permissions after creation
         code, _ = Docker.exec_in_container(
             container,
-            f"mkdir -p {quoted_path}",
+            f"mkdir -p {quoted_path} && chmod {mode} {quoted_path}",
             timeout=5
         )
         return code == 0
@@ -6681,13 +6816,16 @@ fi
         elif task:
             # SECURITY FIX: Use base64 to safely pass task content
             # (heredoc was vulnerable to task containing TASKEOF delimiter)
+            # SECURITY FIX 2: Use stdin to avoid shell expansion of $(cat ...) which
+            # would execute backticks or $() in task content
             import base64
             task_b64 = base64.b64encode(task.encode('utf-8')).decode('ascii')
             task_file = "/tmp/openhands_task.txt"
             # Decode base64 on container side - safe from shell injection
             write_cmd = f"echo '{task_b64}' | base64 -d > {task_file}"
             Docker.exec_in_container(name, write_cmd, timeout=10)
-            oh_cmd = f"openhands --always-approve -t \"$(cat {task_file})\""
+            # Use stdin instead of command substitution to prevent shell expansion
+            oh_cmd = f"cat {task_file} | openhands --always-approve --stdin"
         else:
             oh_cmd = 'openhands --always-approve'
         
@@ -10763,9 +10901,33 @@ class StartupLogScreen(Screen):
             success = Docker.start_ralph_daemon(p)
             
             if success:
-                # Verify daemon is still running after brief wait
-                time.sleep(2)
-                if Docker.is_ralph_daemon_running(p):
+                # HIGH-REL-001 FIX: Poll for .ready file instead of just checking process
+                # This ensures daemon has fully initialized before declaring success
+                self.app.call_from_thread(self.add_log, "Waiting for daemon initialization...")
+                self.app.call_from_thread(self.set_status, "Waiting for daemon ready signal...")
+                
+                ready = False
+                max_wait = 30  # Wait up to 30 seconds for daemon to become ready
+                for i in range(max_wait):
+                    time.sleep(1)
+                    # Check ready file first
+                    code, output = Docker.exec_in_container(
+                        p.container_name,
+                        "test -f /workspace/.ralph/.ready && cat /workspace/.ralph/.ready",
+                        timeout=5
+                    )
+                    if code == 0 and output.strip():
+                        ready = True
+                        self.app.call_from_thread(self.add_log, f"Daemon ready after {i+1}s", "success")
+                        break
+                    # Fallback: also check if process is running
+                    if not Docker.is_ralph_daemon_running(p):
+                        self.app.call_from_thread(self.add_log, f"Daemon crashed during startup", "error")
+                        break
+                    if i > 0 and i % 5 == 0:
+                        self.app.call_from_thread(self.add_log, f"Still waiting... ({i}s)")
+                
+                if ready:
                     ralph.update_config("status", "running")
                     self.app.call_from_thread(self.add_log, "Ralph daemon running!", "success")
                     self.app.call_from_thread(self.set_status, "SUCCESS - Opening monitor...")
@@ -10774,7 +10936,7 @@ class StartupLogScreen(Screen):
                     time.sleep(1)
                     self.app.call_from_thread(self.dismiss, {"success": True, "error": ""})
                 else:
-                    self._show_daemon_failure(p, ralph, "Daemon crashed after starting")
+                    self._show_daemon_failure(p, ralph, "Daemon failed to initialize (no ready signal)")
             else:
                 self._show_daemon_failure(p, ralph, "Daemon failed to start")
             

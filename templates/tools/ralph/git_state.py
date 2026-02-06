@@ -330,10 +330,22 @@ class GitStateManager:
         ref_path = (self.workspace / ".git" / ref_name).resolve()
         git_dir = (self.workspace / ".git").resolve()
         
-        # SECURITY FIX: Ensure path is under .git
-        if not str(ref_path).startswith(str(git_dir) + '/'):
-            logger.error(f"Ref path escapes .git directory: {ref_path}")
+        # SECURITY FIX: Use relative_to() which raises ValueError if path escapes
+        # This is more robust than string-based startswith check which can be bypassed
+        try:
+            ref_path.relative_to(git_dir)
+        except ValueError:
+            logger.error(f"Path traversal attempt: {ref_name} resolved to {ref_path}")
             return False
+        
+        # SECURITY FIX: Reject if any parent component is a symlink (prevents symlink attacks)
+        parts = Path(ref_name).parts
+        check_path = git_dir
+        for part in parts[:-1]:  # Check all directories except the file itself
+            check_path = check_path / part
+            if check_path.is_symlink():
+                logger.error(f"Symlink in ref path: {check_path}")
+                return False
         
         try:
             ref_path.parent.mkdir(parents=True, exist_ok=True)
@@ -356,10 +368,22 @@ class GitStateManager:
         ref_path = (self.workspace / ".git" / ref_name).resolve()
         git_dir = (self.workspace / ".git").resolve()
         
-        # SECURITY FIX: Ensure path is under .git
-        if not str(ref_path).startswith(str(git_dir) + '/'):
-            logger.error(f"Ref path escapes .git directory: {ref_path}")
+        # SECURITY FIX: Use relative_to() which raises ValueError if path escapes
+        # This is more robust than string-based startswith check which can be bypassed
+        try:
+            ref_path.relative_to(git_dir)
+        except ValueError:
+            logger.error(f"Path traversal attempt: {ref_name} resolved to {ref_path}")
             return default
+        
+        # SECURITY FIX: Reject if any parent component is a symlink (prevents symlink attacks)
+        parts = Path(ref_name).parts
+        check_path = git_dir
+        for part in parts[:-1]:  # Check all directories except the file itself
+            check_path = check_path / part
+            if check_path.is_symlink():
+                logger.error(f"Symlink in ref path: {check_path}")
+                return default
         
         try:
             if ref_path.exists():
@@ -380,13 +404,27 @@ class GitStateManager:
         """Set current iteration number."""
         return self._write_ref("ralph/iteration", str(n))
     
-    def increment_iteration(self) -> int:
+    def increment_iteration(self, _retry_count: int = 0) -> int:
         """Atomically increment and return new iteration number.
         
         Uses file locking to prevent race conditions when multiple
         processes try to increment simultaneously.
+        
+        RELIABILITY FIX: Added max_retries to prevent infinite recursion.
+        Uses exponential backoff for retries.
+        
+        Args:
+            _retry_count: Internal counter for retry attempts (don't pass manually)
+        
+        Returns:
+            New iteration number
+            
+        Raises:
+            RuntimeError: If max retries exceeded
         """
         import fcntl
+        
+        MAX_RETRIES = 5
         
         ref_path = self.workspace / ".git" / "ralph" / "iteration"
         ref_path.parent.mkdir(parents=True, exist_ok=True)
@@ -408,10 +446,14 @@ class GitStateManager:
                 finally:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except Exception as e:
-            logger.error(f"Failed to increment iteration: {e}")
-            # FIX: Retry with delay instead of non-atomic fallback (prevents duplicate iteration numbers)
-            time.sleep(0.1)
-            return self.increment_iteration()
+            logger.error(f"Failed to increment iteration (attempt {_retry_count + 1}/{MAX_RETRIES}): {e}")
+            # RELIABILITY FIX: Limit retries to prevent infinite recursion
+            if _retry_count < MAX_RETRIES - 1:
+                # Exponential backoff: 0.1, 0.2, 0.4, 0.8, 1.6 seconds
+                time.sleep(0.1 * (2 ** _retry_count))
+                return self.increment_iteration(_retry_count + 1)
+            else:
+                raise RuntimeError(f"Failed to increment iteration after {MAX_RETRIES} retries: {e}")
     
     def get_current_task(self) -> str:
         """Get current task ID."""

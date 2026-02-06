@@ -312,17 +312,20 @@ def atomic_write_json(filepath: Path, data: dict) -> bool:
 def safe_read_json(filepath: Path, default: Any = None, max_size: int = 50_000_000) -> Any:
     """Safely read JSON with fallback and size limit.
     
-    FIX: Read file first, then check size to avoid TOCTOU race condition
-    (file could be swapped between stat and read).
+    SECURITY FIX: Check file size BEFORE reading to prevent OOM on huge files.
+    Note: There's a theoretical TOCTOU race (file could grow between stat and read),
+    but the practical risk of OOM from unbounded read is far worse than the
+    unlikely scenario of a file growing maliciously between two syscalls.
     """
     if not filepath.exists():
         return default
     try:
-        # Read file first, then check size (avoids TOCTOU race)
-        content = filepath.read_bytes()
-        if len(content) > max_size:
-            log_error(f"File too large: {filepath} ({len(content)} bytes, max {max_size})")
+        # SECURITY FIX: Check size BEFORE reading to prevent OOM
+        file_size = filepath.stat().st_size
+        if file_size > max_size:
+            log_error(f"File too large: {filepath} ({file_size} bytes, max {max_size})")
             return default
+        content = filepath.read_bytes()
         return json.loads(content.decode('utf-8'))
     except Exception:
         return default
@@ -2564,32 +2567,46 @@ def main():
         except Exception:
             pass
     
-    # SECURITY FIX: Write PID file with exclusive lock to prevent impersonation
+    # SECURITY FIX: Use flock on a lock file to prevent PID file race condition
+    # The race was: between unlink() and open(O_EXCL), another process could create the file
+    # Solution: Use flock to serialize all PID file operations
+    lock_file = PID_FILE.with_suffix('.lock')
+    pid_lock_fd = None
     try:
-        # Try to create with O_EXCL (fails if exists = atomic check-and-create)
-        fd = os.open(str(PID_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        try:
-            os.write(fd, str(os.getpid()).encode())
-        finally:
-            os.close(fd)
-    except FileExistsError:
-        # Check if existing daemon is actually running
-        try:
-            old_pid = int(PID_FILE.read_text().strip())
-            os.kill(old_pid, 0)  # Check if process exists
-            log_error(f"Another daemon already running (PID {old_pid})")
-            sys.exit(1)
-        except (ProcessLookupError, ValueError, FileNotFoundError):
-            # Stale PID file, safe to overwrite
+        # Acquire exclusive lock (blocking) - serializes all daemon startups
+        pid_lock_fd = os.open(str(lock_file), os.O_WRONLY | os.O_CREAT, 0o644)
+        fcntl.flock(pid_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # Now safe to check/write PID file while holding lock
+        if PID_FILE.exists():
             try:
-                PID_FILE.unlink()
-            except FileNotFoundError:
+                old_pid = int(PID_FILE.read_text().strip())
+                os.kill(old_pid, 0)  # Check if process exists
+                # Process is running - release lock and exit
+                fcntl.flock(pid_lock_fd, fcntl.LOCK_UN)
+                os.close(pid_lock_fd)
+                log_error(f"Another daemon already running (PID {old_pid})")
+                sys.exit(1)
+            except (ProcessLookupError, ValueError, FileNotFoundError):
+                # Stale PID file - safe to overwrite while holding lock
                 pass
-            fd = os.open(str(PID_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            try:
-                os.write(fd, str(os.getpid()).encode())
-            finally:
-                os.close(fd)
+        
+        # Write our PID (safe because we hold the lock)
+        PID_FILE.write_text(str(os.getpid()))
+        # Keep lock fd open - will be released on process exit
+        # This prevents race conditions for the lifetime of the daemon
+        
+    except BlockingIOError:
+        # Another process is currently starting up
+        if pid_lock_fd is not None:
+            os.close(pid_lock_fd)
+        log_error("Another daemon is starting up (lock held)")
+        sys.exit(1)
+    except Exception as e:
+        if pid_lock_fd is not None:
+            os.close(pid_lock_fd)
+        log_error(f"Failed to acquire PID lock: {e}")
+        sys.exit(1)
     
     log("=" * 60)
     log(f"Ralph Daemon v{DAEMON_VERSION} Started - Git-Native State")
@@ -2598,6 +2615,15 @@ def main():
     log("=" * 60)
     
     init_managers()
+    
+    # HIGH-REL-001 FIX: Create ready file after full initialization
+    # TUI should poll for this file instead of just checking config status
+    ready_file = RALPH_DIR / ".ready"
+    try:
+        ready_file.write_text(f"{os.getpid()}\n{time.time()}")
+        log(f"Ready file created: {ready_file}")
+    except Exception as e:
+        log_error(f"Failed to create ready file: {e}")
     
     consecutive_errors = 0
     retry_delay = BASE_DELAY
