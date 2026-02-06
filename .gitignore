@@ -64,3 +64,6 @@ tests/
 
 # Audit/review files
 docs/reviews/
+-e 
+# Security audit
+SECURITY_AUDIT.md
