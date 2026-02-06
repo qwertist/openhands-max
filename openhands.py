@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
-from collections import deque  # Added for LRU cache
+from collections import deque, OrderedDict  # LRU cache uses OrderedDict for O(1) operations
 
 # Configure logging
 logging.basicConfig(
@@ -3507,9 +3507,9 @@ class SemanticSearch:
     def __init__(self, ralph_dir: Path):
         self.ralph_dir = ralph_dir
         self.cache_file = ralph_dir / "semantic_cache.json"
-        self._embeddings_cache = {}  # text_hash -> embedding
-        # LRU cache: track access order for eviction (oldest first)
-        self._cache_access_order: deque = deque(maxlen=MAX_SEMANTIC_CACHE)
+        # LRU cache using OrderedDict for O(1) move_to_end and popitem operations
+        # Previous implementation used deque which had O(n) removal
+        self._embeddings_cache: OrderedDict = OrderedDict()
         self._load_cache()
     
     @classmethod
@@ -3524,28 +3524,24 @@ class SemanticSearch:
         return cls._model
     
     def _load_cache(self):
-        """Load embeddings cache from disk with LRU tracking."""
+        """Load embeddings cache from disk into OrderedDict (LRU order preserved)."""
         if self.cache_file.exists():
             try:
                 import json
                 with open(self.cache_file, 'r') as f:
-                    self._embeddings_cache = json.load(f)
-                # Initialize access order with existing keys (limited to max)
-                keys = list(self._embeddings_cache.keys())[-MAX_SEMANTIC_CACHE:]
-                self._cache_access_order = deque(keys, maxlen=MAX_SEMANTIC_CACHE)
+                    data = json.load(f)
+                # Load only recent entries, preserving order (most recent at end)
+                keys = list(data.keys())[-MAX_SEMANTIC_CACHE:]
+                self._embeddings_cache = OrderedDict((k, data[k]) for k in keys)
             except Exception:
-                self._embeddings_cache = {}
-                self._cache_access_order = deque(maxlen=MAX_SEMANTIC_CACHE)
+                self._embeddings_cache = OrderedDict()
     
     def _save_cache(self):
-        """Save embeddings cache to disk (LRU entries only)."""
+        """Save embeddings cache to disk (OrderedDict preserves LRU order)."""
         try:
-            # SECURITY FIX: Only save entries in LRU order to prevent unbounded growth
-            to_save = {k: self._embeddings_cache[k] 
-                      for k in self._cache_access_order 
-                      if k in self._embeddings_cache}
+            # OrderedDict naturally preserves order, just save directly
             with open(self.cache_file, 'w') as f:
-                json.dump(to_save, f)
+                json.dump(dict(self._embeddings_cache), f)
         except Exception:
             pass
     
@@ -3555,10 +3551,13 @@ class SemanticSearch:
         return hashlib.md5(text.encode()).hexdigest()[:16]
     
     def _get_embedding(self, text: str):
-        """Get embedding for text (with LRU cache).
+        """Get embedding for text (with LRU cache using OrderedDict).
         
         MEMORY FIX: Implements LRU eviction to cap cache at MAX_SEMANTIC_CACHE
         entries. Each 768-dim float32 embedding is ~3KB, so 10k entries = ~30MB.
+        
+        PERFORMANCE FIX: Uses OrderedDict.move_to_end() which is O(1) instead of
+        deque.remove() which was O(n). With 10k entries this is significant.
         """
         import numpy as np
         model = self._get_model()
@@ -3566,27 +3565,20 @@ class SemanticSearch:
         text_hash = self._text_hash(text)
         
         if text_hash in self._embeddings_cache:
-            # LRU FIX: Move to end (most recently used)
-            if text_hash in self._cache_access_order:
-                self._cache_access_order.remove(text_hash)
-            self._cache_access_order.append(text_hash)
+            # O(1) move to end (most recently used)
+            self._embeddings_cache.move_to_end(text_hash)
             return np.array(self._embeddings_cache[text_hash], dtype=np.float32)
         
-        # LRU FIX: Evict oldest if at limit BEFORE adding new
+        # Evict oldest entries if at limit (O(1) per eviction)
         while len(self._embeddings_cache) >= MAX_SEMANTIC_CACHE:
-            if self._cache_access_order:
-                oldest = self._cache_access_order.popleft()
-                self._embeddings_cache.pop(oldest, None)
-            else:
-                break
+            self._embeddings_cache.popitem(last=False)  # Remove oldest
         
         embedding = model.encode(text, convert_to_numpy=True)
         self._embeddings_cache[text_hash] = embedding.tolist()
-        self._cache_access_order.append(text_hash)
         return embedding.astype(np.float32)
     
     def _get_embeddings_batch(self, texts: List[str]):
-        """Get embeddings for multiple texts efficiently (with LRU cache)."""
+        """Get embeddings for multiple texts efficiently (with OrderedDict LRU cache)."""
         import numpy as np
         model = self._get_model()
         
@@ -3597,30 +3589,24 @@ class SemanticSearch:
         for i, text in enumerate(texts):
             text_hash = self._text_hash(text)
             if text_hash in self._embeddings_cache:
-                # LRU FIX: Update access order for cache hit
-                if text_hash in self._cache_access_order:
-                    self._cache_access_order.remove(text_hash)
-                self._cache_access_order.append(text_hash)
+                # O(1) move to end for cache hit
+                self._embeddings_cache.move_to_end(text_hash)
                 results.append((i, np.array(self._embeddings_cache[text_hash], dtype=np.float32)))
             else:
                 texts_to_encode.append(text)
                 indices_to_encode.append(i)
         
         if texts_to_encode:
-            # LRU FIX: Make room for new entries
-            for text in texts_to_encode:
-                while len(self._embeddings_cache) >= MAX_SEMANTIC_CACHE:
-                    if self._cache_access_order:
-                        oldest = self._cache_access_order.popleft()
-                        self._embeddings_cache.pop(oldest, None)
-                    else:
-                        break
+            # Make room for new entries (O(1) per eviction)
+            evict_count = max(0, len(self._embeddings_cache) + len(texts_to_encode) - MAX_SEMANTIC_CACHE)
+            for _ in range(evict_count):
+                if self._embeddings_cache:
+                    self._embeddings_cache.popitem(last=False)
             
             new_embeddings = model.encode(texts_to_encode, convert_to_numpy=True)
             for idx, text, emb in zip(indices_to_encode, texts_to_encode, new_embeddings):
                 text_hash = self._text_hash(text)
                 self._embeddings_cache[text_hash] = emb.tolist()
-                self._cache_access_order.append(text_hash)
                 results.append((idx, emb.astype(np.float32)))
         
         results.sort(key=lambda x: x[0])

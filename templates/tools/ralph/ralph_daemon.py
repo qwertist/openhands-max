@@ -16,6 +16,7 @@ Usage (inside container):
     python3 /workspace/.ralph/ralph_daemon.py
 """
 
+import fcntl  # For file locking
 import hashlib
 import json
 import os
@@ -1445,45 +1446,63 @@ def get_current_task(prd: dict) -> Optional[dict]:
 
 
 def mark_task_done(task_id: str, passed: bool = True):
-    """Mark a task as done with optimistic locking to prevent concurrent write corruption.
+    """Mark a task as done with proper file locking to prevent concurrent write corruption.
     
-    CRITICAL FIX: Uses optimistic locking with _version field to prevent
-    lost updates when multiple processes write to PRD simultaneously.
+    CRITICAL FIX: Uses fcntl.flock() for exclusive file locking instead of
+    optimistic locking. The original implementation had a TOCTOU race condition
+    where another process could write between version check and save.
+    
+    File locking ensures atomic read-modify-write operations.
     """
     max_retries = 3
     for attempt in range(max_retries):
-        prd = read_prd()
-        version = prd.get("_version", 0)
-        
-        # Find and update the task
-        task_found = False
-        for story in prd.get("userStories", []):
-            if story.get("id") == task_id:
-                story["passes"] = passed
-                story["completedAt"] = datetime.now().isoformat()
-                task_found = True
-                break
-        
-        if not task_found:
-            log_error(f"Task {task_id} not found in PRD")
+        try:
+            # Open for read+write, create if not exists
+            with open(PRD_FILE, 'r+') as f:
+                # Acquire exclusive lock (blocking)
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    # Read while holding lock
+                    content = f.read()
+                    prd = json.loads(content) if content.strip() else {"userStories": [], "verified": False}
+                    
+                    # Find and update the task
+                    task_found = False
+                    for story in prd.get("userStories", []):
+                        if story.get("id") == task_id:
+                            story["passes"] = passed
+                            story["completedAt"] = datetime.now().isoformat()
+                            task_found = True
+                            break
+                    
+                    if not task_found:
+                        log_error(f"Task {task_id} not found in PRD")
+                        return
+                    
+                    # Write back while still holding lock (atomic)
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(prd, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())  # Ensure data hits disk
+                    
+                    log(f"Task {task_id}: {'PASS' if passed else 'FAIL'}")
+                    return
+                finally:
+                    # Release lock (also released automatically on close)
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                    
+        except FileNotFoundError:
+            log_error(f"PRD file not found: {PRD_FILE}")
             return
-        
-        # Increment version for optimistic locking
-        prd["_version"] = version + 1
-        
-        # Verify version hasn't changed during our modification (check-then-act)
-        current = read_prd()
-        if current.get("_version", 0) == version:
-            # Version unchanged, safe to save
-            save_prd(prd)
-            log(f"Task {task_id}: {'PASS' if passed else 'FAIL'}")
-            return
-        
-        # Version changed, retry
-        log_warning(f"PRD modified during update, retrying ({attempt+1}/{max_retries})")
-        time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+        except json.JSONDecodeError as e:
+            log_warning(f"PRD JSON decode error, retrying ({attempt+1}/{max_retries}): {e}")
+            time.sleep(0.1 * (attempt + 1))
+        except (IOError, OSError) as e:
+            log_warning(f"PRD file lock failed, retrying ({attempt+1}/{max_retries}): {e}")
+            time.sleep(0.1 * (attempt + 1))
     
-    log_error(f"Failed to mark task {task_id} after {max_retries} retries due to concurrent modifications")
+    log_error(f"Failed to mark task {task_id} after {max_retries} retries")
 
 
 def parse_ralph_tags(output: str) -> dict:
