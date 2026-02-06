@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Ralph Daemon v2.0 - Enhanced autonomous development daemon.
+Ralph Daemon v2.1 - Enhanced autonomous development daemon.
 
 Major improvements over v1:
 - AdaptiveContext: Smart context selection by relevance
 - DivergenceDetector: Detect circular patterns early
-- KnowledgeDecay: Forget old irrelevant information
-- SelfReflection: Periodic self-assessment checkpoints
 - Enhanced Condenser: Semantic verification instead of keywords
-- LearningsManager with hard limits and compaction
-- Optimized for 250K+ token models (100-150K prompt budget)
+- LearningsManager with semantic deduplication (unlimited growth)
+- HierarchicalMemory with semantic relevance matching
+- Optimized for 200K+ token models (conservative prompt budget)
 
 Goal: Every iteration feels like fresh context - no "stupification" over time.
 
@@ -86,7 +85,7 @@ LOG_FILE = RALPH_DIR / "ralph_daemon.log"
 ITERATIONS_DIR = RALPH_DIR / "iterations"
 PROGRESS_FILE = RALPH_DIR / "progress.jsonl"
 MEMORY_DIR = RALPH_DIR / "memory"
-REFLECTION_DIR = RALPH_DIR / "reflections"
+# REFLECTION_DIR removed - using verification instead
 
 # =============================================================================
 # CONTEXT BUDGET - For 250K token models
@@ -111,7 +110,7 @@ ARCHITECTURE_LIMIT = 10000     # ~2.5K tokens
 LEARNINGS_LIMIT = 30000        # ~7.5K tokens
 MEMORY_CONTEXT_LIMIT = 30000   # ~7.5K tokens
 TASK_CONTEXT_LIMIT = 20000     # ~5K tokens
-REFLECTION_LIMIT = 10000       # ~2.5K tokens
+# REFLECTION_LIMIT removed
 GUARDRAILS_LIMIT = 10000       # ~2.5K tokens
 
 # Semantic thresholds - Tuned for quality
@@ -131,7 +130,7 @@ MAX_SEMANTIC_CACHE = 8000             # Embedding cache entries
 
 # Maintenance intervals
 COMPACT_INTERVAL = 25                 # Compact every N iterations
-REFLECTION_INTERVAL = 15              # Self-reflect every N iterations
+# REFLECTION_INTERVAL removed - using verification instead
 DIVERGENCE_CHECK_WINDOW = 8           # Check last N iterations for loops
 KNOWLEDGE_DECAY_DAYS = 7              # Start decaying after N days
 
@@ -975,228 +974,7 @@ class DivergenceDetector:
 
 
 # =============================================================================
-# KNOWLEDGE DECAY - NEW: Forget old irrelevant information
-# =============================================================================
-
-class KnowledgeDecay:
-    """
-    Implement forgetting curve for old, irrelevant knowledge.
-    
-    Older knowledge that's not relevant to current work
-    should fade to prevent context pollution.
-    """
-    
-    def __init__(self, semantic: SemanticSearch):
-        self.semantic = semantic
-    
-    def decay_learnings(self, learnings: List[Dict], current_task: str, 
-                        current_iteration: int) -> List[Dict]:
-        """
-        Apply decay to learnings based on age and relevance.
-        Returns learnings that should be kept.
-        """
-        if not learnings or not current_task:
-            return learnings
-        
-        kept = []
-        
-        for entry in learnings:
-            content = entry.get('content', '')
-            iteration = entry.get('iteration', 0)
-            
-            # Calculate age in iterations
-            age = current_iteration - iteration
-            
-            # Calculate relevance to current task
-            relevance = self.semantic.compute_similarity(content, current_task)
-            
-            # Decay formula: keep if young OR relevant
-            # - Recent (< 20 iters): always keep
-            # - Medium (20-50 iters): keep if relevance > 0.3
-            # - Old (50-100 iters): keep if relevance > 0.5
-            # - Very old (> 100 iters): keep only if very relevant (> 0.6)
-            
-            should_keep = False
-            
-            if age < 20:
-                should_keep = True
-            elif age < 50:
-                should_keep = relevance > 0.25
-            elif age < 100:
-                should_keep = relevance > 0.40
-            else:
-                should_keep = relevance > 0.55
-            
-            if should_keep:
-                kept.append(entry)
-        
-        if len(kept) < len(learnings):
-            log(f"Knowledge decay: {len(learnings)} -> {len(kept)} entries")
-        
-        return kept
-    
-    def decay_memory_points(self, points: List[str], current_task: str) -> List[str]:
-        """Apply decay to cold memory points."""
-        if not points or not current_task:
-            return points
-        
-        similarities = self.semantic.batch_similarities(current_task, points)
-        
-        # Keep points with any relevance, or if they're about errors/decisions
-        kept = []
-        for point, sim in zip(points, similarities):
-            is_important = any(kw in point.lower() for kw in ['error', 'bug', 'fix', 'decision', 'must', 'never', 'always'])
-            if sim > 0.1 or is_important:
-                kept.append(point)
-        
-        return kept
-
-
-# =============================================================================
-# SELF REFLECTION - NEW: Periodic self-assessment
-# =============================================================================
-
-class SelfReflection:
-    """
-    Periodic self-reflection for the agent.
-    
-    Every N iterations, agent assesses:
-    - Am I making progress?
-    - Am I going in circles?
-    - What should I remember/forget?
-    """
-    
-    def __init__(self, semantic: SemanticSearch):
-        self.semantic = semantic
-        REFLECTION_DIR.mkdir(exist_ok=True)
-        self.history_file = REFLECTION_DIR / "reflections.json"
-        self.last_reflection = 0
-        self._load()
-    
-    def _load(self):
-        data = safe_read_json(self.history_file, {})
-        self.last_reflection = data.get('last_iteration', 0)
-    
-    def _save(self, iteration: int):
-        atomic_write_json(self.history_file, {
-            'last_iteration': iteration,
-            'timestamp': datetime.now().isoformat()
-        })
-        self.last_reflection = iteration
-    
-    def should_reflect(self, iteration: int) -> bool:
-        """Check if reflection is due."""
-        return (iteration - self.last_reflection) >= REFLECTION_INTERVAL
-    
-    def get_reflection_prompt(self, memory: HierarchicalMemory, 
-                              divergence: DivergenceDetector,
-                              learnings_count: int,
-                              iteration: int) -> str:
-        """Build self-reflection prompt."""
-        
-        stats = memory.get_stats()
-        pattern_summary = divergence.get_pattern_summary()
-        
-        prompt = f"""# Self-Reflection Checkpoint - Iteration {iteration}
-
-## Current State
-- Memory: {stats['hot']} hot, {stats['warm']} warm, {stats['cold']} cold entries
-- Learnings: {learnings_count} entries
-- Iterations since last reflection: {iteration - self.last_reflection}
-
-## Recent Pattern Analysis
-{pattern_summary}
-
-## Your Task
-Analyze your recent work and answer:
-
-1. **Progress Assessment**: Are you making meaningful progress? (good/stuck/diverging)
-
-2. **Pattern Detection**: Do you see any circular patterns or repeated mistakes?
-
-3. **Knowledge Quality**: Is your context helping or hurting? What's noise vs signal?
-
-4. **Strategy Review**: Should you change your approach?
-
-## Output Format
-```reflection
-PROGRESS: [good/stuck/diverging]
-PATTERNS: [description of any patterns noticed]
-PRESERVE: [list critical knowledge that MUST be kept]
-FORGET: [list noise that can be removed]
-STRATEGY: [any strategy changes needed]
-```
-"""
-        return prompt
-    
-    def parse_reflection(self, output: str) -> Dict:
-        """Parse reflection output."""
-        result = {
-            'progress': 'unknown',
-            'patterns': '',
-            'preserve': [],
-            'forget': [],
-            'strategy': ''
-        }
-        
-        # Extract from code block
-        match = re.search(r'```reflection\s*\n(.*?)\n```', output, re.DOTALL)
-        if not match:
-            return result
-        
-        content = match.group(1)
-        
-        for line in content.split('\n'):
-            line = line.strip()
-            if line.startswith('PROGRESS:'):
-                result['progress'] = line.split(':', 1)[1].strip().lower()
-            elif line.startswith('PATTERNS:'):
-                result['patterns'] = line.split(':', 1)[1].strip()
-            elif line.startswith('PRESERVE:'):
-                items = line.split(':', 1)[1].strip()
-                result['preserve'] = [i.strip() for i in items.split(',') if i.strip()]
-            elif line.startswith('FORGET:'):
-                items = line.split(':', 1)[1].strip()
-                result['forget'] = [i.strip() for i in items.split(',') if i.strip()]
-            elif line.startswith('STRATEGY:'):
-                result['strategy'] = line.split(':', 1)[1].strip()
-        
-        return result
-    
-    def save_reflection(self, iteration: int, reflection: Dict):
-        """Save reflection results."""
-        reflection_file = REFLECTION_DIR / f"reflection_{iteration:04d}.json"
-        reflection['iteration'] = iteration
-        reflection['timestamp'] = datetime.now().isoformat()
-        atomic_write_json(reflection_file, reflection)
-        self._save(iteration)
-        
-        # Keep only last 10 reflections
-        for old in sorted(REFLECTION_DIR.glob("reflection_*.json"))[:-10]:
-            try:
-                old.unlink()
-            except Exception:
-                pass
-    
-    def get_last_reflection_summary(self) -> str:
-        """Get summary of last reflection for context."""
-        reflections = sorted(REFLECTION_DIR.glob("reflection_*.json"))
-        if not reflections:
-            return ""
-        
-        try:
-            data = json.loads(reflections[-1].read_text())
-            return f"""## Last Self-Reflection (Iteration {data.get('iteration', '?')})
-- Progress: {data.get('progress', '?')}
-- Patterns: {data.get('patterns', 'none')}
-- Strategy: {data.get('strategy', 'continue')}
-"""
-        except Exception:
-            return ""
-
-
-# =============================================================================
-# ADAPTIVE CONTEXT - NEW: Smart context selection
+# ADAPTIVE CONTEXT - Smart context selection
 # =============================================================================
 
 class AdaptiveContext:
@@ -1215,20 +993,17 @@ class AdaptiveContext:
                       architecture: str,
                       learnings: str,
                       memory_context: str,
-                      reflection_summary: str,
                       guardrails: str,
                       budget_chars: int = CONTEXT_BUDGET_CHARS) -> Dict[str, str]:
         """
         Build optimized context within budget.
         
         Priority order:
-        1. Current task (always full)
-        2. Guardrails (critical constraints)
-        3. Relevant learnings (errors, decisions)
-        4. Architecture (relevant parts)
-        5. Memory (relevant history)
-        6. Mission (compressed if needed)
-        7. Reflection (if space)
+        1. Guardrails (critical constraints)
+        2. Relevant learnings (errors, decisions)
+        3. Architecture (relevant parts)
+        4. Memory (relevant history)
+        5. Mission (compressed if needed)
         """
         
         result = {}
@@ -1263,11 +1038,6 @@ class AdaptiveContext:
             mission_budget = min(len(mission), MISSION_LIMIT, remaining // 3)
             result['mission'] = mission[:mission_budget]
             remaining -= len(result['mission'])
-        
-        # 6. Reflection summary if space
-        if reflection_summary and remaining > 2000:
-            result['reflection'] = reflection_summary[:min(len(reflection_summary), remaining)]
-            remaining -= len(result['reflection'])
         
         return result
     
@@ -1605,8 +1375,6 @@ memory: HierarchicalMemory = None
 learnings_mgr: LearningsManager = None
 condenser: ContextCondenser = None
 divergence_detector: DivergenceDetector = None
-knowledge_decay: KnowledgeDecay = None
-self_reflection: SelfReflection = None
 adaptive_context: AdaptiveContext = None
 metrics: RalphMetrics = None
 epochs: EpochManager = None
@@ -1618,7 +1386,7 @@ disk_monitor: DiskSpaceMonitor = None
 def init_managers():
     """Initialize all managers."""
     global semantic_search, memory, learnings_mgr, condenser
-    global divergence_detector, knowledge_decay, self_reflection, adaptive_context
+    global divergence_detector, adaptive_context
     global metrics, epochs, stuck_detector, circuit_breaker, disk_monitor
     
     semantic_search = SemanticSearch()
@@ -1626,8 +1394,6 @@ def init_managers():
     learnings_mgr = LearningsManager(semantic_search)
     condenser = ContextCondenser(semantic_search)
     divergence_detector = DivergenceDetector(semantic_search)
-    knowledge_decay = KnowledgeDecay(semantic_search)
-    self_reflection = SelfReflection(semantic_search)
     adaptive_context = AdaptiveContext(semantic_search)
     metrics = RalphMetrics()
     epochs = EpochManager()
@@ -1635,7 +1401,7 @@ def init_managers():
     circuit_breaker = CircuitBreaker("openhands", threshold=5, timeout=120)
     disk_monitor = DiskSpaceMonitor()
     
-    log("All managers initialized (v2.0 - Enhanced)")
+    log("All managers initialized")
 
 
 # =============================================================================
@@ -1731,10 +1497,6 @@ def get_iteration_type(config: dict) -> str:
     if phase == "verification":
         return "verification"
     
-    # Check for self-reflection
-    if self_reflection and self_reflection.should_reflect(iteration):
-        return "reflection"
-    
     # Check for condense
     should_cond, reason = condenser.should_condense(iteration, config) if condenser else (False, "")
     if should_cond:
@@ -1780,11 +1542,6 @@ def build_prompt(config: dict, iter_type: str) -> str:
     if memory:
         memory_context = memory.get_context(current_task_context, MEMORY_CONTEXT_LIMIT)
     
-    # Get reflection summary
-    reflection_summary = ""
-    if self_reflection:
-        reflection_summary = self_reflection.get_last_reflection_summary()
-    
     # Use adaptive context to optimize
     if adaptive_context:
         optimized = adaptive_context.build_context(
@@ -1793,7 +1550,6 @@ def build_prompt(config: dict, iter_type: str) -> str:
             architecture=architecture,
             learnings=learnings,
             memory_context=memory_context,
-            reflection_summary=reflection_summary,
             guardrails=guardrails
         )
         mission = optimized.get('mission', mission)
@@ -1823,7 +1579,6 @@ def build_prompt(config: dict, iter_type: str) -> str:
         "${architecture}": architecture,
         "${memory_context}": memory_context,
         "${guardrails_section}": guardrails,
-        "${reflection_summary}": reflection_summary,
         "${verify_task_id}": pending.get("taskId", task_id),
         "${previous_attempts}": stuck_detector.get_task_attempts(task_id) if stuck_detector else "",
     }
@@ -1854,8 +1609,7 @@ def load_prompt_template(iter_type: str) -> str:
         "task_verify": "# Verify - Iter ${iteration}\nVerify ${verify_task_id}.\n<ralph>TASK_VERIFIED:${verify_task_id}:PASS</ralph> or FAIL:reason",
         "architect": "# Architect - Iter ${iteration}\nReview architecture. Progress: ${done_tasks}/${total_tasks}",
         "verification": "# Project Verification\n<ralph>PROJECT_VERIFIED</ralph> when complete.",
-        "condense": "# Condense Context\nSummarize key learnings. Remove noise.",
-        "reflection": self_reflection.get_reflection_prompt(memory, divergence_detector, learnings_mgr.count(), 0) if self_reflection else "# Reflect on progress"
+        "condense": "# Condense Context\nSummarize key learnings. Remove noise."
     }
     
     return fallbacks.get(iter_type, f"Continue. Type: {iter_type}")
@@ -1948,22 +1702,6 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
                 result = "condense_failed"
         else:
             result = "condense_done"
-    
-    elif iter_type == "reflection":
-        if self_reflection:
-            reflection = self_reflection.parse_reflection(output)
-            self_reflection.save_reflection(iteration, reflection)
-            
-            # Act on reflection
-            if reflection['progress'] == 'diverging' and divergence_detector:
-                divergence_detector.clear()
-            
-            if metrics:
-                metrics.record_reflection()
-            
-            result = "reflection_done"
-        else:
-            result = "reflection_done"
     
     # Update divergence detector with final result
     if divergence_detector:
@@ -2124,7 +1862,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     
     # Ensure directories
-    for d in [RALPH_DIR, ITERATIONS_DIR, MEMORY_DIR, REFLECTION_DIR]:
+    for d in [RALPH_DIR, ITERATIONS_DIR, MEMORY_DIR]:
         d.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(d, 0o777)
