@@ -1,0 +1,34 @@
+description = "New feature workflow"
+formula = "feature"
+version = 1
+
+[vars.feature_name]
+description = "Name of the feature"
+required = true
+
+[vars.feature_description]
+description = "What the feature should do"
+required = true
+
+[[steps]]
+id = "design"
+title = "Design {{feature_name}}"
+description = "Create design doc for: {{feature_description}}"
+
+[[steps]]
+id = "implement"
+title = "Implement {{feature_name}}"
+description = "Build the feature according to design."
+needs = ["design"]
+
+[[steps]]
+id = "test"
+title = "Test {{feature_name}}"
+description = "Write and run tests for the feature."
+needs = ["implement"]
+
+[[steps]]
+id = "document"
+title = "Document {{feature_name}}"
+description = "Update documentation."
+needs = ["test"]

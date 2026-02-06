@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from collections import deque, OrderedDict  # LRU cache uses OrderedDict for O(1) operations
 
 # Git-native state management (v5.0)
-# git_state.py is in templates/tools/ralph/
+# git_state.py is in ralph/
 _ralph_tools_dir = str(Path(__file__).parent / "templates" / "tools" / "ralph")
 if _ralph_tools_dir not in sys.path:
     sys.path.insert(0, _ralph_tools_dir)
@@ -272,8 +272,8 @@ def substitute_all_templates(script_dir: Path) -> int:
     Substitute environment variables in all template files.
     
     Processes:
-    - templates/llm/*/agent_settings.json
-    - templates/mcp/mcp_servers.json
+    - config/llm/*/agent_settings.json
+    - config/mcp/mcp_servers.json
     
     Returns number of files modified.
     """
@@ -828,11 +828,11 @@ TMUX_OH_SESSION = "openhands"
 # Get script directory
 SCRIPT_DIR = Path(__file__).parent.resolve()
 PROJECTS_DIR = SCRIPT_DIR / "projects"
-TEMPLATES_DIR = SCRIPT_DIR / "templates"
-LLM_TEMPLATES_DIR = TEMPLATES_DIR / "llm"
-MCP_TEMPLATES_DIR = TEMPLATES_DIR / "mcp"
-RALPH_PROMPTS_DIR = TEMPLATES_DIR / "tools" / "ralph"
-SKILLS_TEMPLATES_DIR = TEMPLATES_DIR / "skills"
+CONFIG_DIR = SCRIPT_DIR / "config"
+LLM_TEMPLATES_DIR = CONFIG_DIR / "llm"
+MCP_TEMPLATES_DIR = CONFIG_DIR / "mcp"
+RALPH_PROMPTS_DIR = Path(__file__).parent / "ralph"
+SKILLS_DIR = SCRIPT_DIR / "skills"
 LOG_FILE = SCRIPT_DIR / ".openhands.log"
 
 
@@ -6517,9 +6517,9 @@ touch {mcp_marker}
         name = project.container_name
         
         # Copy ralph_daemon.py to container
-        daemon_src = RALPH_PROMPTS_DIR / "ralph_daemon.py"
+        daemon_src = RALPH_PROMPTS_DIR / "daemon.py"
         if not daemon_src.exists():
-            print(f"[!] ralph_daemon.py not found at {daemon_src}")
+            print(f"[!] daemon.py not found at {daemon_src}")
             return False
         
         # Create .ralph directories in container
@@ -6534,8 +6534,8 @@ touch {mcp_marker}
             Docker.exec_in_container(name, "chmod +x /workspace/.ralph/ralph_daemon.py", timeout=5)
             
             # Copy git_state.py for git-native state management
-            # git_state.py is in templates/tools/ralph/ (same as ralph_daemon.py)
-            git_state_src = RALPH_PROMPTS_DIR / "git_state.py"
+            # git_state.py is in ralph/ (same as ralph_daemon.py)
+            git_state_src = RALPH_PROMPTS_DIR / "state.py"
             if git_state_src.exists():
                 subprocess.run(
                     ["docker", "cp", str(git_state_src), f"{name}:/workspace/.ralph/git_state.py"],
@@ -6588,7 +6588,7 @@ touch {mcp_marker}
                 pass  # Non-critical
         
         # Copy prompt templates if they exist
-        for prompt_file in RALPH_PROMPTS_DIR.glob("*.md"):
+        for prompt_file in RALPH_PROMPTS_DIR.glob("prompts/*.md"):
             try:
                 subprocess.run(
                     ["docker", "cp", str(prompt_file), f"{name}:/workspace/.ralph/prompts/"],
@@ -6608,8 +6608,8 @@ touch {mcp_marker}
         # Create global prompts directory
         Docker.exec_in_container(name, "mkdir -p /workspace/.ralph/prompts/global", timeout=5)
         
-        # Copy all .md files from templates/ralph/ to container
-        for prompt_file in RALPH_PROMPTS_DIR.glob("*.md"):
+        # Copy all .md files from ralph/ to container
+        for prompt_file in RALPH_PROMPTS_DIR.glob("prompts/*.md"):
             try:
                 subprocess.run(
                     ["docker", "cp", str(prompt_file), f"{name}:/workspace/.ralph/prompts/global/"],
@@ -7116,7 +7116,7 @@ class ProjectManager:
         LLM_TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
         MCP_TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
         RALPH_PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-        SKILLS_TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     
     @staticmethod
     def list_projects() -> List[Project]:
@@ -7187,10 +7187,10 @@ class ProjectManager:
             if mcp_path.exists():
                 shutil.copy(mcp_path, openhands_dir / "mcp_servers.json")
             
-            if SKILLS_TEMPLATES_DIR.exists():
+            if SKILLS_DIR.exists():
                 skills_dest = openhands_dir / "skills"
                 skills_dest.mkdir(exist_ok=True)
-                for skill_dir in SKILLS_TEMPLATES_DIR.iterdir():
+                for skill_dir in SKILLS_DIR.iterdir():
                     if skill_dir.is_dir():
                         shutil.copytree(skill_dir, skills_dest / skill_dir.name, dirs_exist_ok=True)
             
@@ -7382,7 +7382,7 @@ class ProjectManager:
     def update_skills(project: Project) -> bool:
         """Update skills from templates."""
         try:
-            if not SKILLS_TEMPLATES_DIR.exists():
+            if not SKILLS_DIR.exists():
                 log_error("Skills template dir not found")
                 return False
             
@@ -7395,7 +7395,7 @@ class ProjectManager:
             qmd_enabled = (project.workspace / ".qmd_enabled").exists()
             
             skills_dest.mkdir(exist_ok=True)
-            for skill_dir in SKILLS_TEMPLATES_DIR.iterdir():
+            for skill_dir in SKILLS_DIR.iterdir():
                 if skill_dir.is_dir():
                     # Skip qmd-search skill if QMD not enabled
                     if skill_dir.name == "qmd-search" and not qmd_enabled:
@@ -8996,8 +8996,8 @@ Current tasks:
         
         Template priority:
         1. Project-specific: workspace/.ralph/prompts/{iter_type}.md
-        2. Global: templates/ralph/{iter_type}.md
-        3. Fallback: templates/ralph/default.md
+        2. Global: ralph/prompts/{iter_type}.md
+        3. Fallback: ralph/prompts/default.md
         """
         iter_type = self.get_iteration_type(iteration)
         
@@ -9009,13 +9009,13 @@ Current tasks:
             return self._substitute_prompt_vars(template, iteration, iter_type)
         
         # 2. Load from global template directory
-        prompt_file = RALPH_PROMPTS_DIR / f"{iter_type}.md"
+        prompt_file = RALPH_PROMPTS_DIR / "prompts" / f"{iter_type}.md"
         if prompt_file.exists():
             template = prompt_file.read_text()
             return self._substitute_prompt_vars(template, iteration, iter_type)
         
         # 3. Fallback: try default.md
-        default_file = RALPH_PROMPTS_DIR / "default.md"
+        default_file = RALPH_PROMPTS_DIR / "prompts" / "default.md"
         if default_file.exists():
             template = default_file.read_text()
             return self._substitute_prompt_vars(template, iteration, iter_type)

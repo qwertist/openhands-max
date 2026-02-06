@@ -1,0 +1,24 @@
+description = "Standard bug fix workflow"
+formula = "bugfix"
+version = 1
+
+[vars.bug_description]
+description = "Description of the bug"
+required = true
+
+[[steps]]
+id = "reproduce"
+title = "Reproduce the bug"
+description = "Write a failing test that reproduces: {{bug_description}}"
+
+[[steps]]
+id = "fix"
+title = "Implement the fix"
+description = "Fix the bug so the test passes."
+needs = ["reproduce"]
+
+[[steps]]
+id = "verify"
+title = "Verify fix"
+description = "Run all tests, ensure no regressions."
+needs = ["fix"]
