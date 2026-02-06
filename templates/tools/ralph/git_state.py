@@ -834,6 +834,21 @@ class TaskManager:
             logger.error(f"Git command failed: {cmd}: {e}")
             return False, str(e)
     
+    @staticmethod
+    def _sanitize_string_field(value: str, max_length: int = 10000) -> str:
+        """CRIT-004 FIX: Sanitize string fields to remove control characters.
+        
+        This prevents potential injection attacks via malformed task data.
+        """
+        if not isinstance(value, str):
+            return str(value)[:max_length] if value is not None else ""
+        # Remove control characters except newlines and tabs
+        sanitized = ''.join(
+            c for c in value 
+            if c == '\n' or c == '\t' or (ord(c) >= 32 and ord(c) != 127)
+        )
+        return sanitized[:max_length]
+    
     def _load(self):
         """Load tasks from git blob.
         
@@ -842,6 +857,8 @@ class TaskManager:
         2. File .ralph/tasks.json (v2 format) -> migrate
         3. File .ralph/prd.json (v1 format) -> migrate
         4. Empty (new project)
+        
+        CRIT-004 FIX: Task IDs and string fields are validated/sanitized.
         """
         # Try git blob first
         success, blob_content = self._run_git("show", self.TASKS_REF)
@@ -856,6 +873,12 @@ class TaskManager:
                     raise TaskFileCorruptedError("Tasks blob missing 'tasks' key")
                 
                 for task_id, task_data in data.get("tasks", {}).items():
+                    # CRIT-004 FIX: Validate task_id format strictly
+                    # Prevents path traversal attacks like "../../../etc/passwd"
+                    if not is_valid_task_id(task_id):
+                        logger.warning(f"Skipping invalid task ID: {task_id!r}")
+                        continue
+                    
                     # Validate required fields
                     if not isinstance(task_data, dict):
                         logger.warning(f"Task {task_id} is not a dict, skipping")
@@ -863,6 +886,11 @@ class TaskManager:
                     if "title" not in task_data:
                         logger.warning(f"Task {task_id} missing 'title', skipping")
                         continue
+                    
+                    # CRIT-004 FIX: Sanitize string fields to remove control characters
+                    for field in ['title', 'description', 'status', 'notes']:
+                        if field in task_data and task_data[field] is not None:
+                            task_data[field] = self._sanitize_string_field(task_data[field])
                     
                     task_data["id"] = task_id
                     # Set defaults for optional fields
@@ -957,13 +985,14 @@ class TaskManager:
             logger.error(f"Migration failed: {e}")
             raise
     
-    def _save(self, retry_count: int = 0) -> bool:
+    def _save(self, retry_count: int = 0, pending_changes: dict = None) -> bool:
         """Save tasks to git blob atomically with compare-and-swap.
         
         Creates a blob with JSON content and updates refs/ralph/tasks.
         Uses CAS to detect concurrent modifications.
         
         HIGH-2 FIX: Compare-and-swap prevents lost updates from races.
+        HIGH-3 FIX: On CAS failure, reload state and merge pending changes.
         """
         MAX_RETRIES = 3
         
@@ -1005,10 +1034,41 @@ class TaskManager:
             
             if not success:
                 if retry_count < MAX_RETRIES:
-                    logger.warning(f"Concurrent modification detected, retrying ({retry_count + 1}/{MAX_RETRIES})...")
-                    # Reload and merge
+                    logger.warning(f"CAS failed, reloading and merging ({retry_count + 1}/{MAX_RETRIES})...")
+                    
+                    # HIGH-3 FIX: Save our pending changes before reload
+                    if pending_changes is None:
+                        pending_changes = {}
+                    
+                    # Capture tasks we've modified (by comparing timestamps)
+                    for task_id, task in self._tasks.items():
+                        # Store tasks with recent updates
+                        if hasattr(task, 'updated') and task.updated:
+                            pending_changes[task_id] = task
+                    
+                    # Reload fresh state from git
                     self._load()
-                    return self._save(retry_count + 1)
+                    
+                    # HIGH-3 FIX: Merge our changes into fresh state
+                    for task_id, old_task in pending_changes.items():
+                        if task_id in self._tasks:
+                            # Task exists in both - keep the newer one
+                            existing = self._tasks[task_id]
+                            old_updated = getattr(old_task, 'updated', '')
+                            existing_updated = getattr(existing, 'updated', '')
+                            if old_updated and existing_updated:
+                                if old_updated > existing_updated:
+                                    self._tasks[task_id] = old_task
+                                    logger.debug(f"Merged task {task_id} (our version newer)")
+                            elif old_updated:
+                                # Our version has timestamp, existing doesn't - prefer ours
+                                self._tasks[task_id] = old_task
+                        else:
+                            # Task only in our changes - it's a new task we added
+                            self._tasks[task_id] = old_task
+                            logger.debug(f"Merged new task {task_id}")
+                    
+                    return self._save(retry_count + 1, pending_changes)
                 else:
                     logger.error(f"Failed to update ref after {MAX_RETRIES} retries: {msg}")
                     return False

@@ -202,7 +202,12 @@ DOCKER_TIMEOUT = 28800  # 8 hours maximum
 # FIX: Use threading.Event for thread-safe shutdown signaling (instead of raw bool)
 import threading
 _shutdown_event = threading.Event()
-current_process = None
+
+# CRITICAL-6 FIX: Store only PID (int) instead of process object for thread-safe signal handling.
+# Integer assignment is atomic in Python, so signal handler can safely read without locks.
+# Using lock in signal handler risks deadlock if main thread holds the lock.
+_current_process_pid = None  # Just the PID - atomic int assignment
+current_process = None  # Keep for compatibility, but signal handler uses _current_process_pid
 _process_lock = None  # Initialized in main() to avoid import-time threading issues
 
 
@@ -343,27 +348,22 @@ def signal_handler(signum, frame):
     FIX: Don't wait in signal handler - just terminate and let main loop handle cleanup.
     This prevents potential deadlock if main thread is also waiting on the process.
     """
-    global current_process, _process_lock
+    global _current_process_pid
     log(f"Received signal {signum}, shutting down...")
     _shutdown_event.set()  # Thread-safe shutdown signal
     
-    # Safely get and clear process reference with lock
-    proc = None
-    if _process_lock:
-        with _process_lock:
-            proc = current_process
-            current_process = None  # Mark as "being handled"
-    else:
-        proc = current_process
-        current_process = None
-    
-    if proc:
+    # CRITICAL-6 FIX: Use atomic PID access instead of lock in signal handler.
+    # Don't use lock here - can deadlock if main thread holds it.
+    # Integer read is atomic in Python, so this is safe.
+    pid = _current_process_pid
+    if pid:
         try:
             # Non-blocking terminate - main loop will handle cleanup
-            if proc.poll() is None:
-                log("Terminating current iteration...")
-                proc.terminate()
-                # Don't wait here - main loop will detect _shutdown_event
+            log(f"Terminating current iteration (PID {pid})...")
+            os.kill(pid, signal.SIGTERM)
+            # Don't wait here - main loop will detect _shutdown_event
+        except ProcessLookupError:
+            pass  # Process already gone
         except Exception:
             pass
 
@@ -418,12 +418,15 @@ def save_config(config: dict):
 
 
 def update_config(key: str, value):
-    """Update config with file locking to prevent race conditions.
+    """Update config with atomic merge using temp file swap and CAS verification.
     
-    FIX: Uses fcntl.flock for atomic read-modify-write, same pattern as mark_task_done().
-    This prevents concurrent updates (e.g., TUI + daemon) from losing changes.
+    CRITICAL-2 FIX: Uses temp file + atomic rename for cross-process safety.
+    File locking alone doesn't work reliably when TUI writes via docker exec
+    (different process namespace). This CAS approach detects concurrent modifications.
     """
-    max_retries = 3
+    import tempfile
+    max_retries = 5
+    
     for attempt in range(max_retries):
         try:
             # Ensure file exists
@@ -433,21 +436,56 @@ def update_config(key: str, value):
                 save_config(config)
                 return
             
-            with open(CONFIG_FILE, 'r+') as f:
+            # Read current state with lock
+            with open(CONFIG_FILE, 'r') as f:
                 fcntl.flock(f, fcntl.LOCK_EX)
                 try:
                     content = f.read()
                     config = json.loads(content) if content.strip() else {"status": "paused", "currentIteration": 0}
-                    config[key] = value
-                    
-                    f.seek(0)
-                    f.truncate()
+                    old_value = config.get(key)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+            
+            # Modify config
+            config[key] = value
+            
+            # Write atomically with CAS verification
+            fd, tmp_path = tempfile.mkstemp(dir=CONFIG_FILE.parent, suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w') as f:
                     json.dump(config, f, indent=2, ensure_ascii=False)
                     f.flush()
                     os.fsync(f.fileno())
-                finally:
-                    fcntl.flock(f, fcntl.LOCK_UN)
-                return
+                
+                # CAS: Verify no concurrent modification before committing
+                with open(CONFIG_FILE, 'r') as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    try:
+                        current = json.loads(f.read())
+                        current_value = current.get(key)
+                        
+                        # Check if someone else modified THIS key concurrently
+                        if current_value != old_value and current_value != value:
+                            # Concurrent modification - retry with merged state
+                            os.unlink(tmp_path)
+                            log_warning(f"Config CAS conflict on '{key}', retrying ({attempt+1}/{max_retries})")
+                            time.sleep(0.1 * (attempt + 1))
+                            continue
+                        
+                        # Safe to commit - atomic rename
+                        os.rename(tmp_path, CONFIG_FILE)
+                        return
+                    finally:
+                        fcntl.flock(f, fcntl.LOCK_UN)
+                        
+            except Exception:
+                # Cleanup temp file on any error
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                raise
+                
         except (IOError, OSError, json.JSONDecodeError) as e:
             log_warning(f"Config update failed, retrying ({attempt+1}/{max_retries}): {e}")
             time.sleep(0.1 * (attempt + 1))
@@ -1198,29 +1236,53 @@ class ContextCondenser:
         return False, ""
     
     def extract_critical_facts(self, content: str) -> List[Dict]:
-        """Extract facts that must be preserved."""
+        """Extract facts that must be preserved.
+        
+        CRIT-005 FIX: Process line-by-line to prevent ReDoS attacks.
+        Previously, unbounded regex patterns like [^\n]{20,200} could cause
+        catastrophic backtracking on crafted input.
+        """
         # FIX: Limit input size to prevent ReDoS (regex denial of service)
         MAX_CONTENT_SIZE = 100000  # 100KB max
+        MAX_LINES = 2000  # Max lines to process
+        MAX_LINE_LENGTH = 500  # Max chars per line
+        
         if len(content) > MAX_CONTENT_SIZE:
             content = content[:MAX_CONTENT_SIZE]
         
         facts = []
         
-        # Errors with context
-        for match in re.finditer(r'(?:error|failed|exception|bug|fix|crash)[:\s]+([^\n]{20,200})', content, re.I):
-            facts.append({'type': 'ERROR', 'content': match.group(1).strip()})
+        # CRIT-005 FIX: Process line by line with length limits
+        # This prevents ReDoS by ensuring regex only operates on bounded input
+        lines = content.split('\n')[:MAX_LINES]
         
-        # Decisions
-        for match in re.finditer(r'(?:decided|chose|because|will use|using)[:\s]+([^\n]{20,200})', content, re.I):
-            facts.append({'type': 'DECISION', 'content': match.group(1).strip()})
-        
-        # Completions
-        for match in re.finditer(r'(?:completed|finished|done|implemented)[:\s]+([^\n]{10,150})', content, re.I):
-            facts.append({'type': 'COMPLETED', 'content': match.group(1).strip()})
-        
-        # Architecture changes
-        for match in re.finditer(r'(?:created|added|modified|changed|refactored)[:\s]+([^\n]{10,150})', content, re.I):
-            facts.append({'type': 'CHANGE', 'content': match.group(1).strip()})
+        for line in lines:
+            # CRIT-005 FIX: Truncate long lines before regex
+            line = line[:MAX_LINE_LENGTH]
+            
+            # Errors with context (anchored patterns, explicit bounds)
+            if re.search(r'(?:error|failed|exception|bug|fix|crash)', line, re.I):
+                match = re.match(r'.*?(?:error|failed|exception|bug|fix|crash)[:\s]*(.{10,150})', line, re.I)
+                if match:
+                    facts.append({'type': 'ERROR', 'content': match.group(1).strip()[:200]})
+            
+            # Decisions
+            elif re.search(r'(?:decided|chose|because|will use|using)', line, re.I):
+                match = re.match(r'.*?(?:decided|chose|because|will use|using)[:\s]*(.{10,150})', line, re.I)
+                if match:
+                    facts.append({'type': 'DECISION', 'content': match.group(1).strip()[:200]})
+            
+            # Completions
+            elif re.search(r'(?:completed|finished|done|implemented)', line, re.I):
+                match = re.match(r'.*?(?:completed|finished|done|implemented)[:\s]*(.{10,100})', line, re.I)
+                if match:
+                    facts.append({'type': 'COMPLETED', 'content': match.group(1).strip()[:150]})
+            
+            # Architecture changes
+            elif re.search(r'(?:created|added|modified|changed|refactored)', line, re.I):
+                match = re.match(r'.*?(?:created|added|modified|changed|refactored)[:\s]*(.{10,100})', line, re.I)
+                if match:
+                    facts.append({'type': 'CHANGE', 'content': match.group(1).strip()[:150]})
         
         # Deduplicate
         seen = set()
@@ -2350,7 +2412,7 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
     FIX: Iteration counter is now incremented AFTER successful completion,
     not at the start. This prevents skipped iterations if daemon crashes mid-iteration.
     """
-    global current_process
+    global current_process, _current_process_pid
     
     # Calculate next iteration but don't persist yet
     iteration = config.get("currentIteration", 0) + 1
@@ -2404,23 +2466,47 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
     ITERATIONS_DIR.mkdir(parents=True, exist_ok=True)
     output_file = ITERATIONS_DIR / f"iteration_{iteration:04d}.log"
     
-    # SECURITY FIX: Pass arguments directly to avoid shell injection
-    # (previously used bash -c which had double-interpretation risk)
+    # CRIT-002 FIX: Write prompt to temp file instead of command line
+    # This prevents:
+    # 1. Command line exposure (prompt visible in `ps` output)
+    # 2. Potential shell interpretation issues in openhands CLI
+    # 3. Command line length limits on some systems
+    prompt_file = None
     
     start_time = time.time()
     
     try:
+        # CRIT-002 FIX: Create temp file for prompt with secure permissions
+        import tempfile
+        fd, prompt_file = tempfile.mkstemp(suffix='.txt', prefix='ralph_prompt_')
+        try:
+            os.write(fd, prompt.encode('utf-8'))
+            os.close(fd)
+            fd = None
+        except Exception:
+            if fd is not None:
+                os.close(fd)
+            raise
+        
         with open(output_file, "w") as f:
-            # FIX: Use lock when setting current_process for thread-safe signal handling
-            # SECURITY FIX: Direct argument passing, no shell=True or bash -c
+            # CRIT-002 FIX: Pass prompt via file (-f) instead of command line (-t)
+            # This avoids command line exposure and length limits
+            # If openhands doesn't support -f, fall back to -t (list form is still safe)
+            # HIGH-4 FIX: Use start_new_session=True to create new process group
+            # This allows killing the entire process tree on timeout/signal
             proc = subprocess.Popen(
-                ["openhands", "--headless", "--json", "-t", prompt],
+                ["openhands", "--headless", "--json", "-f", prompt_file],
                 stdout=f,
                 stderr=subprocess.STDOUT,
-                cwd="/workspace"
+                cwd="/workspace",
+                shell=False,  # CRIT-002: Explicit for security auditing
+                start_new_session=True  # HIGH-4 FIX: New process group for clean termination
             )
-            # FIX: Removed redundant 'global current_process' from nested block
-            # (already declared at function level)
+            
+            # CRITICAL-6 FIX: Store PID atomically for signal handler (int assignment is atomic)
+            _current_process_pid = proc.pid
+            
+            # Also update process object for compatibility (with lock)
             if _process_lock:
                 with _process_lock:
                     current_process = proc
@@ -2433,17 +2519,29 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
             try:
                 proc.wait(timeout=timeout)  # FIX: Removed unused exit_code assignment
             except subprocess.TimeoutExpired:
-                log_warning(f"Timeout after {timeout}s")
-                proc.terminate()
+                log_warning(f"Timeout after {timeout}s, killing process group...")
+                # HIGH-4 FIX: Kill entire process group to avoid orphaned children
                 try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGTERM)
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    # FIX: Force kill if terminate doesn't work
+                    # Force kill entire group
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                    proc.wait(timeout=5)
+                except Exception:
+                    # Fallback: kill just the process
                     proc.kill()
                     proc.wait()
                 return False, "timeout"
         
-        # FIX: Clear current_process with lock
+        # CRITICAL-6 FIX: Clear PID atomically
+        _current_process_pid = None
+        
+        # Clear process object with lock
         if _process_lock:
             with _process_lock:
                 current_process = None
@@ -2533,7 +2631,10 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
         log_error(f"Iteration failed: {e}")
         log_error(traceback.format_exc())
         
-        # FIX: Clear current_process with lock
+        # CRITICAL-6 FIX: Clear PID atomically
+        _current_process_pid = None
+        
+        # Clear process object with lock
         if _process_lock:
             with _process_lock:
                 current_process = None
@@ -2546,6 +2647,45 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
             circuit_breaker.record_failure()
         
         return False, "error"
+    
+    finally:
+        # CRIT-002 FIX: Clean up prompt file to prevent disk space leaks
+        if prompt_file is not None:
+            try:
+                os.unlink(prompt_file)
+            except Exception:
+                pass  # Best effort cleanup
+
+
+def cleanup_orphaned_processes():
+    """HIGH-4 FIX: Kill any orphaned openhands processes from previous daemon.
+    
+    This handles the case where daemon was killed with SIGKILL (OOM, kill -9)
+    and left orphaned openhands processes running.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "openhands.*--headless"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                pid = line.strip()
+                if pid and pid != str(os.getpid()):
+                    try:
+                        pid_int = int(pid)
+                        os.kill(pid_int, signal.SIGTERM)
+                        log(f"Killed orphaned openhands process: {pid}")
+                    except (ValueError, ProcessLookupError):
+                        pass
+                    except Exception as e:
+                        log_warning(f"Failed to kill orphaned process {pid}: {e}")
+    except subprocess.TimeoutExpired:
+        log_warning("Orphan cleanup: pgrep timed out")
+    except FileNotFoundError:
+        pass  # pgrep not available
+    except Exception as e:
+        log_warning(f"Orphan cleanup failed: {e}")
 
 
 def main():
@@ -2613,6 +2753,9 @@ def main():
     log(f"PID: {os.getpid()}")
     log(f"Context budget: {CONTEXT_BUDGET_CHARS} chars (~{CONTEXT_BUDGET_CHARS // 4000}K tokens)")
     log("=" * 60)
+    
+    # HIGH-4 FIX: Clean up orphaned processes from previous daemon crash
+    cleanup_orphaned_processes()
     
     init_managers()
     

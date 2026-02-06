@@ -205,26 +205,54 @@ def check_api_keys() -> Tuple[List[str], List[str]]:
     return missing, configured
 
 
+# CRIT-003 FIX: Only allow explicitly whitelisted environment variables
+# to prevent template injection attacks where attacker-controlled templates
+# could leak sensitive environment variables like PATH, HOME, etc.
+ALLOWED_TEMPLATE_VARS = frozenset({
+    'ANTHROPIC_API_KEY', 'KIMI_API_KEY', 'TAVILY_API_KEY', 
+    'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'DEEPSEEK_API_KEY',
+    'GEMINI_API_KEY', 'GROQ_API_KEY', 'MISTRAL_API_KEY',
+    'TOGETHER_API_KEY', 'FIREWORKS_API_KEY', 'COHERE_API_KEY',
+    'AI21_API_KEY', 'REPLICATE_API_KEY', 'HUGGINGFACE_API_KEY',
+    # Add other legitimate template variables here
+})
+
 def substitute_env_in_file(filepath: Path) -> bool:
     """
     Substitute environment variables in a file.
     
     Replaces ${VAR_NAME} patterns with environment variable values.
     
+    CRIT-003 FIX: Only whitelisted variables are substituted to prevent
+    information leakage via template injection.
+    
     Returns True if file was modified, False otherwise.
     """
     if not filepath.exists():
+        return False
+    
+    # CRIT-003 FIX: Don't follow symlinks (prevent symlink attacks)
+    try:
+        if filepath.is_symlink():
+            print(f"{Colors.RED}Security: Refusing to process symlink: {filepath}{Colors.NC}")
+            return False
+    except Exception:
         return False
     
     try:
         content = filepath.read_text()
         original = content
         
-        # Find all ${VAR_NAME} patterns
-        pattern = re.compile(r'\$\{([^}]+)\}')
+        # CRIT-003 FIX: Stricter pattern - only uppercase letters, numbers, underscores
+        pattern = re.compile(r'\$\{([A-Z][A-Z0-9_]*)\}')
         
         def replace_var(match):
             var_name = match.group(1)
+            # CRIT-003 FIX: Only allow whitelisted variables
+            if var_name not in ALLOWED_TEMPLATE_VARS:
+                # Log blocked substitution attempt (could indicate attack)
+                print(f"{Colors.YELLOW}Blocked substitution of non-whitelisted var: {var_name}{Colors.NC}")
+                return match.group(0)  # Leave unchanged
             return os.environ.get(var_name, match.group(0))
         
         content = pattern.sub(replace_var, content)
@@ -424,6 +452,41 @@ MAX_DELAY = 60.0
 # Disk space monitoring
 MIN_FREE_SPACE_MB = 500
 
+# =============================================================================
+# SYNC-REQUIRED CONSTANTS
+# These constants are duplicated in ralph_daemon.py (runs in Docker container).
+# When changing these, update ralph_daemon.py to match!
+# See DUP-001 through DUP-008 in docs/reviews/final-audit-round3.md
+# =============================================================================
+
+# CircuitBreaker defaults (sync with ralph_daemon.py CircuitBreaker class)
+CIRCUIT_BREAKER_DEFAULT_THRESHOLD = 5       # Failures before opening circuit
+CIRCUIT_BREAKER_DEFAULT_TIMEOUT = 120.0     # Seconds before retry in OPEN state
+CIRCUIT_BREAKER_HALF_OPEN_REQUESTS = 1      # Successful requests to close circuit
+
+# StuckDetector defaults (sync with ralph_daemon.py StuckDetector class)
+STUCK_MAX_TASK_ATTEMPTS = 3                 # Max attempts before marking task blocked
+STUCK_MAX_SAME_ERRORS = 4                   # Max same error before stuck (was 5 in TUI, 4 in daemon)
+STUCK_MAX_NO_PROGRESS = 8                   # Max iterations without progress (was 10 in TUI, 8 in daemon)
+STUCK_MAX_VERIFICATION_FAILS = 3            # Max verification failures in a row
+
+# Semantic search thresholds (sync with ralph_daemon.py)
+SEMANTIC_DUPLICATE_THRESHOLD = 0.72         # Higher = stricter dedup
+SEMANTIC_COMPACT_THRESHOLD = 0.75           # For cold memory compaction
+SEMANTIC_RELEVANCE_THRESHOLD = 0.20         # For selecting relevant content
+SEMANTIC_DIVERGENCE_THRESHOLD = 0.85        # High similarity = potential loop
+SEMANTIC_CONDENSE_VERIFY = 0.50             # Minimum similarity for fact preservation
+
+# Memory limits (sync with ralph_daemon.py)
+MAX_HOT_MEMORY = 8                          # Recent iterations (full detail)
+MAX_WARM_MEMORY = 30                        # Older iterations (summaries)
+MAX_COLD_MEMORY = 150                       # Key points (permanent)
+MAX_SEMANTIC_CACHE = 8000                   # Embedding cache entries
+
+# Maintenance intervals (sync with ralph_daemon.py)
+COMPACT_INTERVAL = 25                       # Compact every N iterations
+DIVERGENCE_CHECK_WINDOW = 8                 # Check last N iterations for loops
+
 # Project name validation (safe for systemd, cron, filesystem)
 VALID_PROJECT_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$')
 
@@ -573,7 +636,6 @@ port=8001
 
 for server in $servers; do
     cmd=$(jq -r --arg s "$server" '.mcpServers[$s].command // empty' "$MCP_SERVERS")
-    args=$(jq -r --arg s "$server" '.mcpServers[$s].args // [] | .[]' "$MCP_SERVERS" | tr '\n' ' ')
     
     if [ -z "$cmd" ]; then
         echo "Skipping $server (no command)"
@@ -596,10 +658,22 @@ for server in $servers; do
             ;;
     esac
     
-    echo "Starting $server on port $port: $cmd $args"
+    # CRIT-001 FIX: Build args array safely to prevent shell injection
+    # Previously: args=$(jq ... | tr '\n' ' ') then full_cmd="$cmd $args" was vulnerable
+    # to shell metacharacters in args like $(whoami) or `id`
+    args_array=()
+    while IFS= read -r arg; do
+        [ -n "$arg" ] && args_array+=("$arg")
+    done < <(jq -r --arg s "$server" '.mcpServers[$s].args // [] | .[]' "$MCP_SERVERS")
     
-    full_cmd="$cmd $args"
-    nohup supergateway --stdio "$full_cmd" --port $port > /tmp/gateway_$server.log 2>&1 &
+    # CRIT-001 FIX: Sanitize server name in log file path (prevent path injection)
+    safe_server="${server//[^a-zA-Z0-9_-]/_}"
+    
+    echo "Starting $server on port $port: $cmd ${args_array[*]}"
+    
+    # CRIT-001 FIX: Use bash array expansion with proper quoting
+    # This prevents shell metacharacters in args from being interpreted
+    nohup supergateway --stdio "$cmd" "${args_array[@]}" --port $port > "/tmp/gateway_${safe_server}.log" 2>&1 &
     echo $! >> "$GATEWAY_PIDS"
     
     sse_servers=$(echo "$sse_servers" | jq --arg url "http://localhost:$port/sse" '. + [$url]')
@@ -1274,11 +1348,20 @@ class CircuitBreaker:
     - HALF_OPEN: testing if recovered
     
     FIX Issue 7: Added state persistence to survive TUI restarts.
+    
+    SYNC REQUIRED: This class is duplicated in ralph_daemon.py (runs in Docker).
+    When modifying this class, update ralph_daemon.py to match!
+    Key differences to maintain:
+    - TUI version (this): has half_open_requests for gradual recovery
+    - Daemon version: simpler but synced behavior
+    See: docs/reviews/final-audit-round3.md DUP-001
     """
     
-    def __init__(self, name: str, failure_threshold: int = 3,
-                 recovery_timeout: float = 60.0, half_open_requests: int = 1,
-                 state_dir: Path = None):
+    def __init__(self, name: str, 
+                 failure_threshold: int = CIRCUIT_BREAKER_DEFAULT_THRESHOLD,
+                 recovery_timeout: float = CIRCUIT_BREAKER_DEFAULT_TIMEOUT, 
+                 half_open_requests: int = CIRCUIT_BREAKER_HALF_OPEN_REQUESTS,
+                 state_dir: Optional[Path] = None):
         self.name = name
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
@@ -1911,7 +1994,15 @@ class NotificationManager:
 # =============================================================================
 
 class DiskSpaceMonitor:
-    """Monitors disk space and triggers cleanup when needed."""
+    """Monitors disk space and triggers cleanup when needed.
+    
+    SYNC REQUIRED: This class is duplicated in ralph_daemon.py (runs in Docker).
+    When modifying this class, update ralph_daemon.py to match!
+    Key differences:
+    - TUI version (this): full implementation with compression, log rotation
+    - Daemon version: simpler, git-native aware, truncation only
+    See: docs/reviews/final-audit-round3.md DUP-003
+    """
     
     def __init__(self, ralph_dir: Path):
         self.ralph_dir = ralph_dir
@@ -3650,19 +3741,27 @@ class StuckDetector:
     Detects when Ralph is stuck and triggers recovery.
     
     Stuck conditions:
-    - Same task attempted 3+ times
-    - Same error repeated 5+ times
-    - No progress for 10+ iterations
-    - Verification failed 3+ times in a row
+    - Same task attempted N times (STUCK_MAX_TASK_ATTEMPTS)
+    - Same error repeated N times (STUCK_MAX_SAME_ERRORS)
+    - No progress for N iterations (STUCK_MAX_NO_PROGRESS)
+    - Verification failed N times in a row (STUCK_MAX_VERIFICATION_FAILS)
+    
+    SYNC REQUIRED: This class is duplicated in ralph_daemon.py (runs in Docker).
+    When modifying this class, update ralph_daemon.py to match!
+    Key differences:
+    - TUI version (this): has verification tracking, fix history methods
+    - Daemon version: simpler, uses same threshold constants
+    See: docs/reviews/final-audit-round3.md DUP-002
     """
     
     def __init__(self, ralph_dir: Path):
         self.ralph_dir = ralph_dir
         self.stuck_file = ralph_dir / "stuck_history.json"
-        self.max_task_attempts = 3
-        self.max_same_errors = 5
-        self.max_no_progress = 10
-        self.max_verification_fails = 3
+        # Use named constants (sync with ralph_daemon.py)
+        self.max_task_attempts = STUCK_MAX_TASK_ATTEMPTS
+        self.max_same_errors = STUCK_MAX_SAME_ERRORS
+        self.max_no_progress = STUCK_MAX_NO_PROGRESS
+        self.max_verification_fails = STUCK_MAX_VERIFICATION_FAILS
     
     def check_stuck(self, current_task_id: str, iteration: int) -> Tuple[bool, str]:
         """
@@ -3864,9 +3963,13 @@ class HierarchicalMemory:
     """
     Three-tier memory system for optimal context usage.
     
-    - Hot: Last 5 iterations, full detail
-    - Warm: Last 20 iterations, summaries
-    - Cold: Key points only, permanent storage
+    - Hot: Last MAX_HOT_MEMORY iterations, full detail
+    - Warm: Last MAX_WARM_MEMORY iterations, summaries
+    - Cold: Key points only, permanent storage (MAX_COLD_MEMORY)
+    
+    SYNC REQUIRED: This class is duplicated in ralph_daemon.py (runs in Docker).
+    When modifying this class, update ralph_daemon.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-006
     """
     
     def __init__(self, ralph_dir: Path):
@@ -4038,6 +4141,11 @@ class SemanticSearch:
     
     MEMORY FIX: Uses LRU eviction to cap cache at MAX_SEMANTIC_CACHE entries
     to prevent unbounded memory growth during long sessions.
+    
+    SYNC REQUIRED: This class is duplicated in ralph_daemon.py (runs in Docker).
+    When modifying this class, update ralph_daemon.py to match!
+    Both use OrderedDict for O(1) LRU cache operations.
+    See: docs/reviews/final-audit-round3.md DUP-005
     """
     
     # Class-level model cache (shared across instances)
@@ -4620,6 +4728,11 @@ class LearningsManager:
     Manage learnings with semantic deduplication.
     
     Prevents duplicate information from accumulating.
+    Uses SEMANTIC_DUPLICATE_THRESHOLD for detecting near-duplicates.
+    
+    SYNC REQUIRED: This class is duplicated in ralph_daemon.py (runs in Docker).
+    When modifying this class, update ralph_daemon.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-007
     """
     
     def __init__(self, ralph_dir: Path, semantic_search: SemanticSearch):
@@ -4698,6 +4811,12 @@ class ContextCondenser:
     - Errors and solutions
     - Project state
     - Patterns and anti-patterns
+    
+    Uses SEMANTIC_CONDENSE_VERIFY threshold for fact preservation verification.
+    
+    SYNC REQUIRED: This class is duplicated in ralph_daemon.py (runs in Docker).
+    When modifying this class, update ralph_daemon.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-008
     """
     
     CONDENSE_PROMPT_TEMPLATE = '''# Context Condensation - Iteration {iteration}
@@ -5064,13 +5183,36 @@ Be THOROUGH. Missing information = lost forever.
 # FIX: Thread-safe logging with lock
 _log_lock = threading.Lock()
 
+
+def _sanitize_log_message(message: str) -> str:
+    """CRIT-006 FIX: Sanitize message for safe logging.
+    
+    Prevents log injection attacks by:
+    - Replacing newlines/carriage returns (prevents fake log entries)
+    - Removing control characters (prevents terminal escape sequences)
+    - Limiting length (prevents log flooding)
+    """
+    if not message:
+        return ""
+    # Replace newlines and carriage returns to prevent log forging
+    message = message.replace('\n', '\\n').replace('\r', '\\r')
+    # Remove other control characters (keep tabs for formatting)
+    message = ''.join(c for c in message if ord(c) >= 32 or c == '\t')
+    # Limit length to prevent log flooding
+    return message[:10000]
+
+
 def log(message: str):
-    """Write to log file (thread-safe)."""
+    """Write to log file (thread-safe).
+    
+    CRIT-006 FIX: Messages are sanitized to prevent log injection.
+    """
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        safe_message = _sanitize_log_message(message)
         with _log_lock:
             with open(LOG_FILE, "a", encoding='utf-8') as f:
-                f.write(f"[{timestamp}] {message}\n")
+                f.write(f"[{timestamp}] {safe_message}\n")
                 f.flush()  # Ensure immediate write
     except Exception:
         pass
@@ -5602,8 +5744,9 @@ class Docker:
                           sensitive: bool = False) -> Tuple[int, str]:
         """Execute command in container.
         
-        SECURITY WARNING: This method executes shell commands. For user-provided
-        content, ALWAYS use write_file_safe() which base64-encodes content.
+        SECURITY WARNING: This method executes shell commands via bash -c.
+        For user-provided content, ALWAYS use write_file_safe() which base64-encodes content,
+        or use exec_in_container_safe() which doesn't use shell interpretation.
         
         Use timeout presets: Docker.TIMEOUT_QUICK (10s), Docker.TIMEOUT_NORMAL (60s),
         Docker.TIMEOUT_INSTALL (600s) for appropriate operations.
@@ -5619,6 +5762,49 @@ class Docker:
             )
             output = result.stdout + result.stderr
             # HIGH-SEC-001: Redact secrets from output
+            if sensitive:
+                output = Docker._redact_secrets(output)
+            return result.returncode, output
+        except subprocess.TimeoutExpired:
+            return -1, "Timeout"
+        except Exception as e:
+            return -1, str(e)
+    
+    @staticmethod
+    def exec_in_container_safe(name: str, command: List[str], timeout: int = 60,
+                               cwd: str = None, sensitive: bool = False) -> Tuple[int, str]:
+        """CRIT-007 FIX: Execute command in container WITHOUT shell interpretation.
+        
+        This is the safe alternative to exec_in_container() when dealing with
+        user-controlled data. Commands are passed directly to the container
+        without going through bash -c.
+        
+        Args:
+            name: Container name
+            command: List of command arguments (NOT a shell string)
+            timeout: Timeout in seconds
+            cwd: Working directory in container (optional)
+            sensitive: If True, redact potential secrets from output
+        
+        Returns:
+            Tuple of (return_code, output)
+        
+        Example:
+            # Instead of: exec_in_container(name, f"cat {user_file}")  # UNSAFE!
+            # Use: exec_in_container_safe(name, ["cat", user_file])    # SAFE
+        """
+        docker_cmd = ["docker", "exec"]
+        if cwd:
+            docker_cmd.extend(["-w", cwd])
+        docker_cmd.append(name)
+        docker_cmd.extend(command)
+        
+        try:
+            result = subprocess.run(
+                docker_cmd,
+                capture_output=True, text=True, timeout=timeout
+            )
+            output = result.stdout + result.stderr
             if sensitive:
                 output = Docker._redact_secrets(output)
             return result.returncode, output
@@ -7988,7 +8174,12 @@ When something fails, add a SIGN here so future iterations avoid the mistake.
             return False
     
     def get_prd(self) -> dict:
-        """Get current PRD via Docker with corruption recovery."""
+        """Get current PRD via Docker with corruption recovery.
+        
+        CRITICAL-1 FIX: When TaskManager is available (git-native state),
+        read task status from TaskManager instead of prd.json to prevent
+        dual-write split brain where daemon and TUI disagree on task status.
+        """
         default_prd = {
             "projectName": self.project.name,
             "phase": "planning",
@@ -7996,6 +8187,41 @@ When something fails, add a SIGN here so future iterations avoid the mistake.
             "userStories": []
         }
         
+        # CRITICAL-1 FIX: Prefer git-native TaskManager state when available
+        # This prevents split brain where daemon writes to TaskManager
+        # but TUI reads stale prd.json
+        if self.task_manager:
+            try:
+                tasks = self.task_manager.get_all_tasks()
+                if tasks:
+                    user_stories = []
+                    for task in tasks:
+                        story = {
+                            "id": task.id,
+                            "title": task.title,
+                            "description": task.description,
+                            "status": task.status,
+                            "passes": task.status == "done",
+                            "depends": task.depends,
+                            "acceptance_criteria": getattr(task, 'acceptance_criteria', []),
+                        }
+                        user_stories.append(story)
+                    
+                    # Get phase from config (TaskManager doesn't store phase)
+                    config = self.get_config()
+                    phase = config.get("phase", "execution") if config else "execution"
+                    
+                    return {
+                        "projectName": self.project.name,
+                        "phase": phase,
+                        "verified": config.get("verified", False) if config else False,
+                        "userStories": user_stories
+                    }
+            except Exception as e:
+                log(f"TaskManager read failed, falling back to prd.json: {e}")
+                # Fall through to prd.json fallback
+        
+        # Fallback: read from prd.json (legacy mode or TaskManager unavailable)
         prd = self._read_json("prd.json", default=None)
         
         if prd is None:
