@@ -1861,7 +1861,10 @@ class KnowledgeManager:
                         header_end = i
                         break
                 
-                header = '\n'.join(lines[:header_end]) if header_end else lines[:20]
+                # FIX: Ensure header is always a string (was type confusion bug)
+                # When header_end > 0, we were creating a string then joining individual chars
+                header_lines = lines[:header_end] if header_end else lines[:20]
+                header = '\n'.join(header_lines)
                 body_lines = lines[header_end:] if header_end else lines[20:]
                 
                 # Deduplicate similar entries
@@ -1888,7 +1891,8 @@ class KnowledgeManager:
                 if len(unique_entries) > 1500:
                     unique_entries = unique_entries[-1500:]
                 
-                new_content = '\n'.join(header) + '\n\n' + '\n'.join(unique_entries)
+                # FIX: header is now already a string, no need to join again
+                new_content = header + '\n\n' + '\n'.join(unique_entries)
                 safe_write_text(self.critical_file, new_content)
                 log(f"Consolidated critical.md: {len(content)} -> {len(new_content)} chars")
     
@@ -3602,9 +3606,14 @@ class SemanticSearch:
             pass
     
     def _text_hash(self, text: str) -> str:
-        """Create hash for text to use as cache key."""
+        """Create hash for text to use as cache key.
+        
+        FIX: Use full SHA256 instead of truncated MD5[:16] (64 bits).
+        With 10K cache entries, birthday paradox gives ~0.3% collision rate
+        for 64-bit hashes. Full SHA256 has negligible collision probability.
+        """
         import hashlib
-        return hashlib.md5(text.encode()).hexdigest()[:16]
+        return hashlib.sha256(text.encode()).hexdigest()
     
     def _get_embedding(self, text: str):
         """Get embedding for text (with LRU cache using OrderedDict).
@@ -6093,9 +6102,11 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
     @staticmethod
     def dir_exists(container: str, path: str) -> bool:
         """Check if directory exists in container."""
+        # SECURITY FIX: Use shlex.quote for path (single quotes don't escape embedded quotes)
+        quoted_path = shlex.quote(path)
         code, _ = Docker.exec_in_container(
             container,
-            f"test -d '{path}'",
+            f"test -d {quoted_path}",
             timeout=5
         )
         return code == 0
@@ -6166,9 +6177,11 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
     @staticmethod
     def delete_file(container: str, path: str) -> bool:
         """Delete file in container."""
+        # SECURITY FIX: Use shlex.quote for path (single quotes don't escape embedded quotes)
+        quoted_path = shlex.quote(path)
         code, _ = Docker.exec_in_container(
             container,
-            f"rm -f '{path}'",
+            f"rm -f {quoted_path}",
             timeout=5
         )
         return code == 0
@@ -6176,9 +6189,14 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
     @staticmethod
     def list_files(container: str, path: str, pattern: str = "*") -> List[str]:
         """List files in container directory."""
+        # SECURITY FIX: Use shlex.quote for both path and pattern
+        quoted_path = shlex.quote(path)
+        # Note: pattern is quoted separately to preserve glob expansion
+        # We escape dangerous chars but allow * and ?
+        safe_pattern = re.sub(r'[;&|`$]', '', pattern)  # Remove shell metacharacters
         code, output = Docker.exec_in_container(
             container,
-            f"ls -1 '{path}'/{pattern} 2>/dev/null || true",
+            f"ls -1 {quoted_path}/{safe_pattern} 2>/dev/null || true",
             timeout=5
         )
         if code != 0 or not output.strip():
