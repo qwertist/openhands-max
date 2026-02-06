@@ -15,9 +15,9 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-# Add parent to path for imports
+# Add templates/tools/ralph to path for git_state imports
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "templates" / "tools" / "ralph"))
 
 from git_state import (
     generate_task_id, is_valid_task_id,

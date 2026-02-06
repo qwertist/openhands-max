@@ -40,6 +40,11 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from collections import deque, OrderedDict  # LRU cache uses OrderedDict for O(1) operations
 
 # Git-native state management (v5.0)
+# git_state.py is in templates/tools/ralph/
+_ralph_tools_dir = str(Path(__file__).parent / "templates" / "tools" / "ralph")
+if _ralph_tools_dir not in sys.path:
+    sys.path.insert(0, _ralph_tools_dir)
+
 try:
     from git_state import (
         GitStateManager, TaskManager, FormulaManager,
@@ -5959,7 +5964,8 @@ touch {mcp_marker}
             Docker.exec_in_container(name, "chmod +x /workspace/.ralph/ralph_daemon.py", timeout=5)
             
             # Copy git_state.py for git-native state management
-            git_state_src = Path(__file__).parent / "git_state.py"
+            # git_state.py is in templates/tools/ralph/ (same as ralph_daemon.py)
+            git_state_src = RALPH_PROMPTS_DIR / "git_state.py"
             if git_state_src.exists():
                 subprocess.run(
                     ["docker", "cp", str(git_state_src), f"{name}:/workspace/.ralph/git_state.py"],

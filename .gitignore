@@ -24,6 +24,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
 
 # Virtual environments
 venv/
@@ -57,3 +58,9 @@ projects/
 *.temp
 .cache/
 old/
+
+# Tests
+tests/
+
+# Audit/review files
+docs/reviews/
