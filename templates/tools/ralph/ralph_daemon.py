@@ -105,14 +105,14 @@ REFLECTION_DIR = RALPH_DIR / "reflections"
 #   - Buffer: 40K chars (~10K tokens)
 # =============================================================================
 
-CONTEXT_BUDGET_CHARS = 400000  # ~100K tokens total budget
-MISSION_LIMIT = 40000          # ~10K tokens
-ARCHITECTURE_LIMIT = 40000     # ~10K tokens
-LEARNINGS_LIMIT = 80000        # ~20K tokens
-MEMORY_CONTEXT_LIMIT = 60000   # ~15K tokens
-TASK_CONTEXT_LIMIT = 40000     # ~10K tokens
-REFLECTION_LIMIT = 20000       # ~5K tokens
-GUARDRAILS_LIMIT = 20000       # ~5K tokens
+CONTEXT_BUDGET_CHARS = 150000  # ~37K tokens - leaves room for model reasoning
+MISSION_LIMIT = 10000          # ~2.5K tokens
+ARCHITECTURE_LIMIT = 10000     # ~2.5K tokens
+LEARNINGS_LIMIT = 30000        # ~7.5K tokens
+MEMORY_CONTEXT_LIMIT = 30000   # ~7.5K tokens
+TASK_CONTEXT_LIMIT = 20000     # ~5K tokens
+REFLECTION_LIMIT = 10000       # ~2.5K tokens
+GUARDRAILS_LIMIT = 10000       # ~2.5K tokens
 
 # Semantic thresholds - Tuned for quality
 SEMANTIC_DUPLICATE_THRESHOLD = 0.72   # Higher = stricter dedup (was 0.55)
