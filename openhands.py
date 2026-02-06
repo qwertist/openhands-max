@@ -153,14 +153,23 @@ MIN_FREE_SPACE_MB = 500
 # Project name validation (safe for systemd, cron, filesystem)
 VALID_PROJECT_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$')
 
+# FIX: Docker reserved container names that could cause conflicts
+DOCKER_RESERVED_NAMES = {'scratch', 'builder', 'host', 'null', 'root', 'bridge', 'none'}
+
 def validate_project_name(name: str) -> Tuple[bool, str]:
-    """Validate project name for safety in systemd, cron, filesystem."""
+    """Validate project name for safety in systemd, cron, filesystem, and Docker."""
     if not name:
         return False, "Project name cannot be empty"
     if len(name) > 64:
         return False, "Project name too long (max 64 characters)"
     if not VALID_PROJECT_NAME_PATTERN.match(name):
         return False, "Project name can only contain letters, numbers, underscores, and hyphens (must start with letter/number)"
+    # FIX: Check Docker reserved names
+    if name.lower() in DOCKER_RESERVED_NAMES:
+        return False, f"'{name}' is a reserved Docker name"
+    # FIX: Reject names that look like IP addresses (confuses Docker)
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', name):
+        return False, "Project name cannot look like an IP address"
     return True, ""
 
 # =============================================================================
@@ -517,7 +526,7 @@ class Project:
         return "not configured"
     
     def get_container_status(self) -> str:
-        """Get container status: running, stopped, none."""
+        """Get container status: running, stopped, none, timeout, unknown."""
         try:
             result = subprocess.run(
                 ["docker", "ps", "-a", "--filter", f"name=^{self.container_name}$", 
@@ -528,7 +537,10 @@ class Project:
             if not status:
                 return "none"
             return "running" if status.startswith("Up") else "stopped"
-        except Exception:
+        except subprocess.TimeoutExpired:
+            return "timeout"  # FIX: Distinguish timeout from other errors
+        except Exception as e:
+            log_error(f"Container status check failed: {e}")
             return "unknown"
     
     def get_ralph_config(self) -> dict:
@@ -715,9 +727,14 @@ class StateManager:
             return []
     
     def add_pending_task(self, task: str) -> bool:
-        """Add a task to the pending queue."""
+        """Add a task to the pending queue with size limit."""
+        MAX_PENDING_TASKS = 100  # FIX: Prevent unbounded queue growth
         try:
             tasks = self.get_pending_tasks()
+            # FIX: Check size limit
+            if len(tasks) >= MAX_PENDING_TASKS:
+                log_error(f"Pending task queue full ({MAX_PENDING_TASKS}), dropping oldest")
+                tasks = tasks[-(MAX_PENDING_TASKS - 1):]  # Make room
             tasks.append(task)
             safe_write_json(self.pending_tasks_file, tasks)
             return True
@@ -950,10 +967,12 @@ class CircuitBreaker:
     
     def can_proceed(self) -> bool:
         """Check if request can proceed."""
-        if self.state == "CLOSED":
+        state = self.state  # Local copy for consistency
+        
+        if state == "CLOSED":
             return True
         
-        if self.state == "OPEN":
+        if state == "OPEN":
             # Check if recovery timeout passed
             if time.time() - self.last_failure_time >= self.recovery_timeout:
                 self.state = "HALF_OPEN"
@@ -962,7 +981,13 @@ class CircuitBreaker:
                 return True
             return False
         
-        # HALF_OPEN - allow limited requests
+        if state == "HALF_OPEN":
+            return True
+        
+        # FIX: Handle invalid state - reset to closed
+        log_error(f"Circuit {self.name}: invalid state '{state}', resetting to CLOSED")
+        self.state = "CLOSED"
+        self.failures = 0
         return True
     
     def record_success(self):
@@ -978,13 +1003,16 @@ class CircuitBreaker:
     
     def record_failure(self, error: str = ""):
         """Record failed call."""
-        self.failures += 1
         self.last_failure_time = time.time()
         
+        # FIX: In HALF_OPEN, immediately go to OPEN on any failure (don't increment counter)
         if self.state == "HALF_OPEN":
             self.state = "OPEN"
             log(f"Circuit {self.name}: HALF_OPEN -> OPEN (still failing: {error[:100]})")
-        elif self.failures >= self.failure_threshold:
+            return
+        
+        self.failures += 1
+        if self.failures >= self.failure_threshold:
             self.state = "OPEN"
             log(f"Circuit {self.name}: CLOSED -> OPEN (threshold reached: {error[:100]})")
     
@@ -3228,10 +3256,16 @@ class StuckDetector:
             return 'skip_task'
     
     def _load_history(self) -> List[dict]:
-        """Load stuck history."""
+        """Load stuck history with size limit."""
+        MAX_HISTORY_ENTRIES = 1000  # FIX: Prevent unbounded memory growth
         if self.stuck_file.exists():
             try:
-                return json.loads(self.stuck_file.read_text())
+                data = json.loads(self.stuck_file.read_text())
+                # FIX: Limit history size to prevent memory issues
+                if isinstance(data, list) and len(data) > MAX_HISTORY_ENTRIES:
+                    data = data[-MAX_HISTORY_ENTRIES:]
+                    self._save_history(data)
+                return data
             except Exception:
                 return []
         return []
@@ -4535,18 +4569,23 @@ Be THOROUGH. Missing information = lost forever.
 # LOGGING
 # =============================================================================
 
+# FIX: Thread-safe logging with lock
+_log_lock = threading.Lock()
+
 def log(message: str):
-    """Write to log file."""
+    """Write to log file (thread-safe)."""
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(LOG_FILE, "a", encoding='utf-8') as f:
-            f.write(f"[{timestamp}] {message}\n")
+        with _log_lock:
+            with open(LOG_FILE, "a", encoding='utf-8') as f:
+                f.write(f"[{timestamp}] {message}\n")
+                f.flush()  # Ensure immediate write
     except Exception:
         pass
 
 
 def log_error(message: str):
-    """Log error message."""
+    """Log error message (thread-safe)."""
     log(f"ERROR: {message}")
 
 
@@ -12143,9 +12182,43 @@ def run_shell(container_name: str):
 # =============================================================================
 # MAIN
 # =============================================================================
+# SIGNAL HANDLERS FOR CLEANUP
+# =============================================================================
+
+_cleanup_handlers: List[callable] = []
+_signal_installed = False
+
+def register_cleanup(handler: callable):
+    """Register a cleanup handler to be called on SIGINT/SIGTERM."""
+    _cleanup_handlers.append(handler)
+
+def _signal_handler(signum, frame):
+    """Handle SIGINT/SIGTERM for graceful cleanup."""
+    log(f"Received signal {signum}, cleaning up...")
+    for handler in _cleanup_handlers:
+        try:
+            handler()
+        except Exception as e:
+            log_error(f"Cleanup handler failed: {e}")
+    sys.exit(128 + signum)
+
+def install_signal_handlers():
+    """Install signal handlers for graceful cleanup."""
+    global _signal_installed
+    if not _signal_installed:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+        _signal_installed = True
+        log("Signal handlers installed for graceful cleanup")
+
+
+# =============================================================================
 
 def main():
     import argparse
+    
+    # FIX: Install signal handlers for graceful cleanup
+    install_signal_handlers()
     
     # Initialize directories first (projects, templates, etc.)
     ProjectManager.init_directories()
