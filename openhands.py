@@ -5837,6 +5837,15 @@ touch {mcp_marker}
                 check=True, timeout=10
             )
             Docker.exec_in_container(name, "chmod +x /workspace/.ralph/ralph_daemon.py", timeout=5)
+            
+            # Copy git_state.py for git-native state management
+            git_state_src = Path(__file__).parent / "git_state.py"
+            if git_state_src.exists():
+                subprocess.run(
+                    ["docker", "cp", str(git_state_src), f"{name}:/workspace/.ralph/git_state.py"],
+                    check=True, timeout=10
+                )
+                print("  Installed git_state.py for git-native state")
         except Exception as e:
             print(f"[!] Failed to install ralph daemon: {e}")
             return False
@@ -6816,12 +6825,13 @@ class RalphManager:
         if GIT_STATE_AVAILABLE:
             try:
                 self.git_state = GitStateManager(project.workspace)
-                self.task_manager = TaskManager(self.ralph_dir, project.name[:2])
-                self.formula_manager = FormulaManager(self.ralph_dir)
+                # FIX: Pass workspace as first arg (git repo root), ralph_dir as optional
+                self.task_manager = TaskManager(project.workspace, project.name[:2], self.ralph_dir)
+                self.formula_manager = FormulaManager(project.workspace, self.ralph_dir)
                 # Create built-in formulas if not exist
                 if not self.formula_manager.list_formulas():
                     self.formula_manager.create_builtin_formulas()
-                log(f"Git-native state management enabled (v5.0)")
+                log(f"Git-native state management enabled (v5.1)")
             except Exception as e:
                 log_error(f"Failed to initialize git state: {e}")
                 self.git_state = None

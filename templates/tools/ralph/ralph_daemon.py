@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ralph Daemon v2.1 - Enhanced autonomous development daemon.
+Ralph Daemon v3.0 - Enhanced autonomous development daemon.
 
 Major improvements over v1:
 - AdaptiveContext: Smart context selection by relevance
@@ -89,17 +89,18 @@ def _init_git_state():
     global GIT_STATE_AVAILABLE, _git_state_manager, _task_manager
     
     try:
-        # Add parent directory to path for imports
+        # git_state.py is copied to same directory by TUI setup
         import sys
-        parent_dir = str(Path(__file__).parent.parent.parent.parent)
-        if parent_dir not in sys.path:
-            sys.path.insert(0, parent_dir)
+        daemon_dir = str(Path(__file__).parent)
+        if daemon_dir not in sys.path:
+            sys.path.insert(0, daemon_dir)
         
         from git_state import GitStateManager, TaskManager
         
         workspace = Path("/workspace").resolve()
         _git_state_manager = GitStateManager(workspace)
-        _task_manager = TaskManager(RALPH_DIR)
+        # Pass workspace first (git repo root), then prefix, then ralph_dir
+        _task_manager = TaskManager(workspace, "oh", RALPH_DIR)
         GIT_STATE_AVAILABLE = True
         print(f"[Ralph] Git-native state enabled (daemon v{DAEMON_VERSION})")
     except Exception as e:
