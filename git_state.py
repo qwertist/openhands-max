@@ -155,6 +155,23 @@ class GitCheckpoint:
 
 
 # =============================================================================
+# EXCEPTIONS
+# =============================================================================
+
+class GitCommandError(Exception):
+    """Exception raised when a git command fails."""
+    def __init__(self, message: str, returncode: int = None, stderr: str = None):
+        super().__init__(message)
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+class TaskFileCorruptedError(Exception):
+    """Raised when the tasks file is corrupted."""
+    pass
+
+
+# =============================================================================
 # GIT STATE MANAGER
 # =============================================================================
 
@@ -184,8 +201,26 @@ class GitStateManager:
         if not git_dir.exists():
             raise ValueError(f"Not a git repository: {self.workspace}")
     
-    def _run_git(self, *args, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-        """Run git command in workspace."""
+    def _run_git(self, *args, check: bool = True, capture: bool = True, 
+                strict: bool = False) -> subprocess.CompletedProcess:
+        """Run git command in workspace.
+        
+        Args:
+            args: Git command arguments
+            check: If True, log warning on non-zero exit (does NOT raise)
+            capture: Capture stdout/stderr
+            strict: If True, raise GitCommandError on non-zero exit
+        
+        Returns:
+            CompletedProcess result
+        
+        Raises:
+            GitCommandError: If strict=True and command fails
+            subprocess.TimeoutExpired: If command times out
+        
+        Note: check=True only logs, it does NOT raise (for backward compat).
+              Use strict=True if you need an exception on failure.
+        """
         cmd = ["git"] + list(args)
         try:
             result = subprocess.run(
@@ -195,12 +230,28 @@ class GitStateManager:
                 text=True,
                 timeout=30
             )
-            if check and result.returncode != 0:
-                logger.warning(f"Git command failed: {' '.join(cmd)}\n{result.stderr}")
+            if result.returncode != 0:
+                if strict:
+                    raise GitCommandError(
+                        f"Git command failed: {' '.join(cmd)}",
+                        returncode=result.returncode,
+                        stderr=result.stderr
+                    )
+                elif check:
+                    logger.warning(f"Git command failed: {' '.join(cmd)}\n{result.stderr}")
             return result
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             logger.error(f"Git command timed out: {' '.join(cmd)}")
+            # Kill the process if still running
+            if hasattr(e, 'process') and e.process:
+                try:
+                    e.process.kill()
+                    e.process.wait()
+                except Exception:
+                    pass
             raise
+        except GitCommandError:
+            raise  # Re-raise our own exception
         except Exception as e:
             logger.error(f"Git command error: {e}")
             raise
@@ -324,10 +375,38 @@ class GitStateManager:
         return self._write_ref("ralph/iteration", str(n))
     
     def increment_iteration(self) -> int:
-        """Increment and return new iteration number."""
-        n = self.get_iteration() + 1
-        self.set_iteration(n)
-        return n
+        """Atomically increment and return new iteration number.
+        
+        Uses file locking to prevent race conditions when multiple
+        processes try to increment simultaneously.
+        """
+        import fcntl
+        
+        ref_path = self.workspace / ".git" / "ralph" / "iteration"
+        ref_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Use file locking for atomicity
+        try:
+            with open(ref_path, 'a+') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    content = f.read().strip()
+                    n = int(content) if content else 0
+                    n += 1
+                    f.seek(0)
+                    f.truncate()
+                    f.write(str(n))
+                    f.flush()
+                    return n
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception as e:
+            logger.error(f"Failed to increment iteration: {e}")
+            # Fallback to non-atomic increment
+            n = self.get_iteration() + 1
+            self.set_iteration(n)
+            return n
     
     def get_current_task(self) -> str:
         """Get current task ID."""
@@ -667,13 +746,23 @@ class TaskManager:
         self._load()
     
     def _load(self):
-        """Load tasks from file."""
+        """Load tasks from file.
+        
+        Raises TaskFileCorruptedError if the file exists but is corrupted,
+        to prevent silent data loss.
+        """
         if not self.tasks_file.exists():
             self._tasks = {}
             return
         
         try:
-            data = json.loads(self.tasks_file.read_text())
+            content = self.tasks_file.read_text()
+            if not content.strip():
+                # Empty file is OK
+                self._tasks = {}
+                return
+            
+            data = json.loads(content)
             version = data.get("version", 1)
             
             if version == 1:
@@ -684,9 +773,17 @@ class TaskManager:
                 for task_id, task_data in data.get("tasks", {}).items():
                     task_data["id"] = task_id
                     self._tasks[task_id] = Task.from_dict(task_data)
+                    
+        except json.JSONDecodeError as e:
+            # Corrupted JSON - don't silently discard!
+            logger.error(f"Corrupted tasks file: {e}")
+            raise TaskFileCorruptedError(
+                f"Tasks file corrupted: {self.tasks_file}. "
+                f"Backup and recreate, or fix the JSON manually."
+            ) from e
         except Exception as e:
             logger.error(f"Failed to load tasks: {e}")
-            self._tasks = {}
+            raise
     
     def _migrate_from_v1(self, data: dict):
         """Migrate from old prd.json format."""
@@ -803,23 +900,52 @@ class TaskManager:
         return True
     
     def get_next_task(self) -> Optional[Task]:
-        """Get next pending task (respecting dependencies)."""
+        """Get next pending task (respecting dependencies).
+        
+        Detects circular dependencies and treats them as unmet.
+        """
         for task in self._tasks.values():
             if task.status != "pending":
                 continue
             
-            # Check dependencies
-            deps_met = True
-            for dep_id in task.depends:
-                dep = self._tasks.get(dep_id)
-                if dep and dep.status != "done":
-                    deps_met = False
-                    break
-            
-            if deps_met:
+            # Check dependencies with cycle detection
+            if self._deps_met(task.id, set()):
                 return task
         
         return None
+    
+    def _deps_met(self, task_id: str, visited: set) -> bool:
+        """Check if dependencies are met, detecting cycles.
+        
+        Args:
+            task_id: Task to check
+            visited: Set of already visited task IDs (for cycle detection)
+        
+        Returns:
+            True if all dependencies are satisfied
+        """
+        # Cycle detection
+        if task_id in visited:
+            logger.warning(f"Circular dependency detected involving: {task_id}")
+            return False
+        
+        task = self._tasks.get(task_id)
+        if not task:
+            return True  # Missing task = assume satisfied
+        
+        visited.add(task_id)
+        
+        for dep_id in task.depends:
+            dep = self._tasks.get(dep_id)
+            if not dep:
+                continue  # Missing dependency = ignore
+            if dep.status != "done":
+                return False
+            # Check transitive dependencies (recursive)
+            if not self._deps_met(dep_id, visited.copy()):
+                return False
+        
+        return True
     
     def get_all_tasks(self) -> List[Task]:
         """Get all tasks."""
