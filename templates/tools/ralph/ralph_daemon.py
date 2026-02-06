@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-Ralph Daemon - Full-featured autonomous development daemon.
+Ralph Daemon v2.0 - Enhanced autonomous development daemon.
 
-Runs inside Docker container with complete logic:
-- HierarchicalMemory (hot/warm/cold tiers)
-- ContextCondenser with verification
-- LearningsManager with semantic deduplication
-- SemanticSearch using sentence-transformers
-- StuckDetector with recovery strategies
-- CircuitBreaker for service resilience
-- DiskSpaceMonitor with cleanup
-- Full prompt variable substitution
-- Robust error handling with retries
-- Watchdog-compatible heartbeat
+Major improvements over v1:
+- AdaptiveContext: Smart context selection by relevance
+- DivergenceDetector: Detect circular patterns early
+- KnowledgeDecay: Forget old irrelevant information
+- SelfReflection: Periodic self-assessment checkpoints
+- Enhanced Condenser: Semantic verification instead of keywords
+- LearningsManager with hard limits and compaction
+- Optimized for 250K+ token models (100-150K prompt budget)
 
-Auto-installs dependencies if missing.
+Goal: Every iteration feels like fresh context - no "stupification" over time.
 
 Usage (inside container):
     python3 /workspace/.ralph/ralph_daemon.py
@@ -31,9 +28,10 @@ import sys
 import time
 import shlex
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Set
+from collections import deque
 
 
 # =============================================================================
@@ -72,7 +70,7 @@ def install_dependencies():
 install_dependencies()
 
 # =============================================================================
-# CONSTANTS
+# CONSTANTS - Optimized for 250K+ context models
 # =============================================================================
 
 RALPH_DIR = Path("/workspace/.ralph")
@@ -88,24 +86,60 @@ LOG_FILE = RALPH_DIR / "ralph_daemon.log"
 ITERATIONS_DIR = RALPH_DIR / "iterations"
 PROGRESS_FILE = RALPH_DIR / "progress.jsonl"
 MEMORY_DIR = RALPH_DIR / "memory"
+REFLECTION_DIR = RALPH_DIR / "reflections"
 
-# Limits
+# =============================================================================
+# CONTEXT BUDGET - For 250K token models
+# =============================================================================
+# Total model context: ~250K tokens (~1M chars)
+# OpenHands overhead: ~50K tokens
+# Our budget: ~100-150K tokens (~400-600K chars)
+#
+# Allocation:
+#   - Mission/Architecture: 60K chars (~15K tokens)
+#   - Learnings (condensed): 80K chars (~20K tokens)
+#   - Memory context: 60K chars (~15K tokens)  
+#   - Current task + history: 40K chars (~10K tokens)
+#   - Self-reflection: 20K chars (~5K tokens)
+#   - Guardrails: 20K chars (~5K tokens)
+#   - Buffer: 40K chars (~10K tokens)
+# =============================================================================
+
+CONTEXT_BUDGET_CHARS = 400000  # ~100K tokens total budget
+MISSION_LIMIT = 40000          # ~10K tokens
+ARCHITECTURE_LIMIT = 40000     # ~10K tokens
+LEARNINGS_LIMIT = 80000        # ~20K tokens
+MEMORY_CONTEXT_LIMIT = 60000   # ~15K tokens
+TASK_CONTEXT_LIMIT = 40000     # ~10K tokens
+REFLECTION_LIMIT = 20000       # ~5K tokens
+GUARDRAILS_LIMIT = 20000       # ~5K tokens
+
+# Semantic thresholds - Tuned for quality
+SEMANTIC_DUPLICATE_THRESHOLD = 0.72   # Higher = stricter dedup (was 0.55)
+SEMANTIC_COMPACT_THRESHOLD = 0.75     # For cold memory compaction
+SEMANTIC_RELEVANCE_THRESHOLD = 0.20   # For selecting relevant content
+SEMANTIC_DIVERGENCE_THRESHOLD = 0.85  # High similarity = potential loop
+SEMANTIC_CONDENSE_VERIFY = 0.50       # Minimum similarity for fact preservation
+
+# Limits - Prevent unbounded growth
+MAX_LEARNINGS_ENTRIES = 400           # Hard limit on learnings
+MAX_HOT_MEMORY = 8                    # Recent iterations (full detail)
+MAX_WARM_MEMORY = 30                  # Older iterations (summaries)
+MAX_COLD_MEMORY = 150                 # Key points (permanent)
+MAX_ITERATION_LOGS = 200              # Keep last N iteration logs
+MAX_SEMANTIC_CACHE = 8000             # Embedding cache entries
+
+# Maintenance intervals
+COMPACT_INTERVAL = 25                 # Compact every N iterations
+REFLECTION_INTERVAL = 15              # Self-reflect every N iterations
+DIVERGENCE_CHECK_WINDOW = 8           # Check last N iterations for loops
+KNOWLEDGE_DECAY_DAYS = 7              # Start decaying after N days
+
+# Verification
+MAX_VERIFY_RETRIES = 3
 MAX_RETRIES = 3
 BASE_DELAY = 30
 MAX_CONSECUTIVE_ERRORS = 5
-CONTEXT_SIZE_LIMIT = 150000  # chars, ~37K tokens
-LEARNINGS_LIMIT = 30000
-ARCHITECTURE_LIMIT = 10000
-MISSION_LIMIT = 10000
-MEMORY_CONTEXT_LIMIT = 30000
-
-# Semantic thresholds
-SEMANTIC_DUPLICATE_THRESHOLD = 0.55  # For learnings deduplication
-SEMANTIC_COMPACT_THRESHOLD = 0.70    # For cold memory compaction
-SEMANTIC_RELEVANCE_THRESHOLD = 0.15  # For selecting relevant content
-
-# Verification
-MAX_VERIFY_RETRIES = 3  # Retries if no TASK_VERIFIED tag
 
 # Daemon state
 shutdown_requested = False
@@ -136,24 +170,18 @@ def log_warning(message: str):
     log(message, "WARN")
 
 
+def log_debug(message: str):
+    log(message, "DEBUG")
+
+
 # =============================================================================
 # ATOMIC FILE OPERATIONS
 # =============================================================================
 
 def atomic_write_text(filepath: Path, content: str) -> bool:
-    """
-    Write text to file, preserving ownership if file exists.
-    
-    Strategy to avoid permission issues between Docker (root) and host:
-    - If file exists: write directly (preserves original ownership)
-    - If file doesn't exist: create with 0666 permissions
-    
-    This allows host-created files to remain writable by host after daemon updates them.
-    """
+    """Write text atomically, preserving ownership."""
     filepath = Path(filepath)
-    
     try:
-        # Ensure parent exists with open permissions
         filepath.parent.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(filepath.parent, 0o777)
@@ -161,17 +189,13 @@ def atomic_write_text(filepath: Path, content: str) -> bool:
             pass
         
         file_existed = filepath.exists()
-        
-        # Write content directly (preserves ownership if file exists)
         filepath.write_text(content)
         
-        # Only chmod new files (existing files keep their ownership/permissions)
         if not file_existed:
             try:
                 os.chmod(filepath, 0o666)
             except Exception:
                 pass
-        
         return True
     except Exception as e:
         log_error(f"Write failed for {filepath}: {e}")
@@ -181,6 +205,16 @@ def atomic_write_text(filepath: Path, content: str) -> bool:
 def atomic_write_json(filepath: Path, data: dict) -> bool:
     """Atomically write JSON file."""
     return atomic_write_text(filepath, json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def safe_read_json(filepath: Path, default: Any = None) -> Any:
+    """Safely read JSON with fallback."""
+    if not filepath.exists():
+        return default
+    try:
+        return json.loads(filepath.read_text())
+    except Exception:
+        return default
 
 
 # =============================================================================
@@ -199,6 +233,7 @@ def signal_handler(signum, frame):
             current_process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             current_process.kill()
+            current_process.wait()
 
 
 def write_heartbeat():
@@ -206,8 +241,8 @@ def write_heartbeat():
     try:
         HEARTBEAT_FILE.write_text(str(int(time.time())))
         os.chmod(HEARTBEAT_FILE, 0o666)
-    except Exception as e:
-        log_error(f"Failed to write heartbeat: {e}")
+    except Exception:
+        pass
 
 
 def add_progress(iteration: int, message: str):
@@ -225,53 +260,35 @@ def add_progress(iteration: int, message: str):
 
 
 def read_config() -> dict:
-    """Read Ralph config."""
-    try:
-        if CONFIG_FILE.exists():
-            return json.loads(CONFIG_FILE.read_text())
-    except Exception as e:
-        log_error(f"Failed to read config: {e}")
-    return {"status": "paused"}
+    return safe_read_json(CONFIG_FILE, {"status": "paused"})
 
 
 def save_config(config: dict):
-    """Save full config atomically."""
     if not atomic_write_json(CONFIG_FILE, config):
         log_error("Failed to save config")
 
 
 def update_config(key: str, value):
-    """Update single config value."""
     config = read_config()
     config[key] = value
     save_config(config)
 
 
 def read_prd() -> dict:
-    """Read PRD file."""
-    try:
-        if PRD_FILE.exists():
-            return json.loads(PRD_FILE.read_text())
-    except Exception as e:
-        log_error(f"Failed to read PRD: {e}")
-    return {"userStories": [], "verified": False}
+    return safe_read_json(PRD_FILE, {"userStories": [], "verified": False})
 
 
 def save_prd(prd: dict):
-    """Save PRD file atomically."""
     if not atomic_write_json(PRD_FILE, prd):
         log_error("Failed to save PRD")
 
 
 # =============================================================================
-# SEMANTIC SEARCH - Using sentence-transformers for true semantic similarity
+# SEMANTIC SEARCH - Enhanced with LRU cache
 # =============================================================================
 
 class SemanticSearch:
-    """
-    Semantic search using Sentence Transformers embeddings.
-    Uses all-mpnet-base-v2 model for best quality English text similarity.
-    """
+    """Semantic search with LRU cache and batch operations."""
     
     _model = None
     _model_loaded = False
@@ -279,42 +296,43 @@ class SemanticSearch:
     def __init__(self):
         self.cache_file = RALPH_DIR / "semantic_cache.json"
         self._embeddings_cache = {}
+        self._cache_access_order = deque(maxlen=MAX_SEMANTIC_CACHE)
         self._load_cache()
     
     @classmethod
     def _get_model(cls):
-        """Lazy-load Sentence Transformer model (once per process)."""
+        """Lazy-load Sentence Transformer model."""
         if cls._model_loaded:
             return cls._model
         
         cls._model_loaded = True
         try:
             from sentence_transformers import SentenceTransformer
-            # Use best quality model for English
             cls._model = SentenceTransformer('all-mpnet-base-v2')
-            log("Loaded sentence-transformers model: all-mpnet-base-v2")
-        except ImportError:
-            log_error("sentence-transformers not installed! Run: pip install sentence-transformers")
-            raise RuntimeError("sentence-transformers required for semantic search")
+            log("Loaded sentence-transformers: all-mpnet-base-v2")
         except Exception as e:
-            log_error(f"Failed to load sentence-transformers model: {e}")
+            log_error(f"Failed to load model: {e}")
             raise
         return cls._model
     
     def _load_cache(self):
         if self.cache_file.exists():
             try:
-                self._embeddings_cache = json.loads(self.cache_file.read_text())
+                data = json.loads(self.cache_file.read_text())
+                # Load only recent entries
+                keys = list(data.keys())[-MAX_SEMANTIC_CACHE:]
+                self._embeddings_cache = {k: data[k] for k in keys}
+                self._cache_access_order = deque(keys, maxlen=MAX_SEMANTIC_CACHE)
             except Exception:
                 self._embeddings_cache = {}
     
     def _save_cache(self):
         try:
-            # Limit cache to 10000 entries
-            if len(self._embeddings_cache) > 10000:
-                keys = list(self._embeddings_cache.keys())[-10000:]
-                self._embeddings_cache = {k: self._embeddings_cache[k] for k in keys}
-            self.cache_file.write_text(json.dumps(self._embeddings_cache))
+            # Save only entries in access order
+            to_save = {k: self._embeddings_cache[k] 
+                      for k in self._cache_access_order 
+                      if k in self._embeddings_cache}
+            self.cache_file.write_text(json.dumps(to_save))
             os.chmod(self.cache_file, 0o666)
         except Exception:
             pass
@@ -323,47 +341,34 @@ class SemanticSearch:
         return hashlib.md5(text.encode()).hexdigest()[:16]
     
     def _get_embedding(self, text: str):
-        """Get embedding for text with caching."""
+        """Get embedding with LRU cache."""
         import numpy as np
         model = self._get_model()
         
         text_hash = self._text_hash(text)
+        
         if text_hash in self._embeddings_cache:
+            # Move to end (most recently used)
+            if text_hash in self._cache_access_order:
+                self._cache_access_order.remove(text_hash)
+            self._cache_access_order.append(text_hash)
             return np.array(self._embeddings_cache[text_hash], dtype=np.float32)
         
+        # Compute new embedding
         embedding = model.encode(text, convert_to_numpy=True)
+        
+        # LRU eviction
+        if len(self._embeddings_cache) >= MAX_SEMANTIC_CACHE:
+            oldest = self._cache_access_order.popleft()
+            self._embeddings_cache.pop(oldest, None)
+        
         self._embeddings_cache[text_hash] = embedding.tolist()
+        self._cache_access_order.append(text_hash)
+        
         return embedding.astype(np.float32)
     
-    def _get_embeddings_batch(self, texts: List[str]):
-        """Get embeddings for multiple texts efficiently."""
-        import numpy as np
-        model = self._get_model()
-        
-        results = []
-        texts_to_encode = []
-        indices_to_encode = []
-        
-        for i, text in enumerate(texts):
-            text_hash = self._text_hash(text)
-            if text_hash in self._embeddings_cache:
-                results.append((i, np.array(self._embeddings_cache[text_hash], dtype=np.float32)))
-            else:
-                texts_to_encode.append(text)
-                indices_to_encode.append(i)
-        
-        if texts_to_encode:
-            new_embeddings = model.encode(texts_to_encode, convert_to_numpy=True)
-            for idx, text, emb in zip(indices_to_encode, texts_to_encode, new_embeddings):
-                text_hash = self._text_hash(text)
-                self._embeddings_cache[text_hash] = emb.tolist()
-                results.append((idx, emb.astype(np.float32)))
-        
-        results.sort(key=lambda x: x[0])
-        return np.array([emb for _, emb in results], dtype=np.float32)
-    
     def compute_similarity(self, text1: str, text2: str) -> float:
-        """Compute cosine similarity between two texts."""
+        """Compute cosine similarity."""
         from sentence_transformers.util import cos_sim
         emb1 = self._get_embedding(text1)
         emb2 = self._get_embedding(text2)
@@ -371,101 +376,64 @@ class SemanticSearch:
     
     def find_similar(self, query: str, documents: List[str], top_k: int = 5,
                      threshold: float = 0.1) -> List[Tuple[int, float, str]]:
-        """Find most similar documents to query."""
+        """Find most similar documents."""
         if not documents:
             return []
         
         from sentence_transformers.util import cos_sim
+        import numpy as np
         
         query_emb = self._get_embedding(query)
-        doc_embs = self._get_embeddings_batch(documents)
+        doc_embs = np.array([self._get_embedding(d) for d in documents])
         
         similarities = cos_sim(query_emb, doc_embs)[0].numpy()
         
-        results = []
-        for i, (score, doc) in enumerate(zip(similarities, documents)):
-            if score >= threshold:
-                results.append((i, float(score), doc))
-        
+        results = [(i, float(s), d) for i, (s, d) in enumerate(zip(similarities, documents)) if s >= threshold]
         results.sort(key=lambda x: x[1], reverse=True)
-        self._save_cache()
+        
         return results[:top_k]
     
-    def is_duplicate(self, new_text: str, existing_texts: List[str], threshold: float = 0.55) -> bool:
-        """Check if new_text is semantically duplicate of any existing text."""
+    def is_duplicate(self, new_text: str, existing_texts: List[str], threshold: float = SEMANTIC_DUPLICATE_THRESHOLD) -> bool:
+        """Check if semantically duplicate."""
         if not existing_texts:
             return False
         similar = self.find_similar(new_text, existing_texts, top_k=1, threshold=threshold)
         return len(similar) > 0
     
-    def select_relevant(self, query: str, sections: List[str], max_chars: int = 15000) -> str:
-        """Select most relevant sections for query within char budget."""
-        if not sections:
-            return ""
+    def batch_similarities(self, query: str, documents: List[str]) -> List[float]:
+        """Get similarities for all documents."""
+        if not documents:
+            return []
         
-        total_size = sum(len(s) for s in sections)
-        if total_size <= max_chars:
-            return '\n\n'.join(sections)
+        from sentence_transformers.util import cos_sim
+        import numpy as np
         
-        similar = self.find_similar(query, sections, top_k=len(sections), threshold=SEMANTIC_RELEVANCE_THRESHOLD)
+        query_emb = self._get_embedding(query)
+        doc_embs = np.array([self._get_embedding(d) for d in documents])
         
-        # Always include last 2 sections (most recent)
-        recent_indices = set(range(max(0, len(sections) - 2), len(sections)))
-        
-        result = []
-        used_indices = set()
-        remaining = max_chars
-        
-        # Add recent first
-        for idx in recent_indices:
-            section = sections[idx]
-            if len(section) <= remaining:
-                result.append((idx, section))
-                used_indices.add(idx)
-                remaining -= len(section)
-        
-        # Add by relevance
-        for idx, score, section in similar:
-            if idx in used_indices:
-                continue
-            if len(section) <= remaining:
-                result.append((idx, section))
-                used_indices.add(idx)
-                remaining -= len(section)
-        
-        result.sort(key=lambda x: x[0])
-        return '\n\n'.join(s for _, s in result)
+        return cos_sim(query_emb, doc_embs)[0].numpy().tolist()
+    
+    def flush_cache(self):
+        """Save cache to disk."""
+        self._save_cache()
 
 
 # =============================================================================
-# HIERARCHICAL MEMORY - Hot/Warm/Cold storage
+# HIERARCHICAL MEMORY - Optimized for large context
 # =============================================================================
 
 class HierarchicalMemory:
-    """
-    Three-tier memory system:
-    - Hot: Last 10 iterations, full detail
-    - Warm: Next 40 iterations, summaries
-    - Cold: Key points, permanent
-    """
+    """Three-tier memory with relevance-based retrieval."""
     
-    def __init__(self):
+    def __init__(self, semantic: SemanticSearch):
         MEMORY_DIR.mkdir(exist_ok=True)
+        self.semantic = semantic
         self.hot_file = MEMORY_DIR / "hot.json"
         self.warm_file = MEMORY_DIR / "warm.json"
         self.cold_file = MEMORY_DIR / "cold.json"
-        
-        self.hot_limit = 10
-        self.warm_limit = 40
-        self.cold_limit = 200
     
     def _load(self, filepath: Path) -> List:
-        if filepath.exists():
-            try:
-                return json.loads(filepath.read_text())
-            except Exception:
-                return []
-        return []
+        return safe_read_json(filepath, [])
     
     def _save(self, filepath: Path, data: List):
         try:
@@ -475,235 +443,456 @@ class HierarchicalMemory:
             log_error(f"Failed to save {filepath}: {e}")
     
     def add_iteration(self, iteration: int, task_id: str, summary: str, 
-                      details: str, key_points: List[str] = None):
-        """Add iteration to memory."""
+                      details: str, key_points: List[str] = None, outcome: str = ""):
+        """Add iteration to memory with outcome tracking."""
         entry = {
             'iteration': iteration,
             'task_id': task_id,
             'summary': summary,
-            'details': details,
-            'key_points': key_points or [],
+            'details': details[:3000],  # Limit details size
+            'key_points': (key_points or [])[:10],
+            'outcome': outcome,
             'timestamp': datetime.now().isoformat()
         }
         
         hot = self._load(self.hot_file)
         hot.append(entry)
         
-        while len(hot) > self.hot_limit:
+        # Move old to warm
+        while len(hot) > MAX_HOT_MEMORY:
             old = hot.pop(0)
             self._add_to_warm(old)
         
         self._save(self.hot_file, hot)
     
     def _add_to_warm(self, entry: dict):
+        """Move to warm tier with compression."""
         warm = self._load(self.warm_file)
         warm_entry = {
             'iteration': entry['iteration'],
             'task_id': entry['task_id'],
-            'summary': entry['summary'][:500],
+            'summary': entry['summary'][:300],
             'key_points': entry.get('key_points', [])[:5],
+            'outcome': entry.get('outcome', ''),
             'timestamp': entry['timestamp']
         }
         warm.append(warm_entry)
         
-        while len(warm) > self.warm_limit:
+        while len(warm) > MAX_WARM_MEMORY:
             old = warm.pop(0)
             self._add_to_cold(old)
         
         self._save(self.warm_file, warm)
     
     def _add_to_cold(self, entry: dict):
+        """Extract key points to permanent storage."""
         cold = self._load(self.cold_file)
+        
         for point in entry.get('key_points', []):
             if point and point not in cold:
                 cold.append(point)
-        cold = list(dict.fromkeys(cold))[-self.cold_limit:]
+        
+        # Add outcome as key point if significant
+        outcome = entry.get('outcome', '')
+        if outcome and outcome not in ['working', 'unknown'] and outcome not in cold:
+            cold.append(f"[{entry['task_id']}] {outcome}")
+        
+        # Deduplicate cold storage
+        cold = list(dict.fromkeys(cold))[-MAX_COLD_MEMORY:]
         self._save(self.cold_file, cold)
     
-    def get_context(self, task_keywords: List[str] = None, max_chars: int = 30000) -> str:
-        """Get memory context for prompt."""
+    def get_context(self, current_task: str, max_chars: int = MEMORY_CONTEXT_LIMIT) -> str:
+        """Get contextually relevant memory."""
         parts = []
         remaining = max_chars
         
-        # Hot - full detail
+        # Hot tier - always include recent
         hot = self._load(self.hot_file)
         if hot:
-            hot_text = "## Recent Iterations (detailed)\n"
-            for entry in hot[-3:]:
+            hot_text = "## Recent Iterations\n"
+            for entry in hot[-5:]:  # Last 5 with details
                 hot_text += f"\n### Iteration {entry['iteration']}: {entry['task_id']}\n"
-                hot_text += entry.get('details', entry.get('summary', ''))[:1000]
+                hot_text += f"Outcome: {entry.get('outcome', 'unknown')}\n"
+                hot_text += entry.get('summary', '')[:500]
+                if entry.get('key_points'):
+                    hot_text += "\nKey points:\n" + '\n'.join(f"- {p}" for p in entry['key_points'][:3])
                 hot_text += "\n"
-            parts.append(hot_text)
-            remaining -= len(hot_text)
+            
+            if len(hot_text) <= remaining:
+                parts.append(hot_text)
+                remaining -= len(hot_text)
         
-        # Warm - relevant summaries
-        if remaining > 5000:
+        # Warm tier - select by relevance
+        if remaining > 5000 and current_task:
             warm = self._load(self.warm_file)
-            if warm and task_keywords:
-                scored = []
-                for entry in warm:
-                    text = entry.get('summary', '') + ' '.join(entry.get('key_points', []))
-                    score = sum(1 for kw in task_keywords if kw.lower() in text.lower())
-                    scored.append((score, entry))
+            if warm:
+                # Score by relevance to current task
+                warm_texts = [f"{e['task_id']} {e['summary']}" for e in warm]
+                similarities = self.semantic.batch_similarities(current_task, warm_texts)
                 
-                scored.sort(reverse=True, key=lambda x: x[0])
-                relevant = [e for s, e in scored[:5] if s > 0]
+                scored = list(zip(warm, similarities))
+                scored.sort(key=lambda x: x[1], reverse=True)
+                
+                relevant = [e for e, s in scored[:5] if s > SEMANTIC_RELEVANCE_THRESHOLD]
                 
                 if relevant:
                     warm_text = "\n## Related Past Work\n"
                     for entry in relevant:
-                        warm_text += f"- [{entry['task_id']}] {entry['summary'][:200]}\n"
-                    parts.append(warm_text)
-                    remaining -= len(warm_text)
+                        warm_text += f"- [{entry['task_id']}] {entry['summary'][:150]} ({entry.get('outcome', '?')})\n"
+                    
+                    if len(warm_text) <= remaining:
+                        parts.append(warm_text)
+                        remaining -= len(warm_text)
         
-        # Cold - key points
-        if remaining > 2000:
+        # Cold tier - key points by relevance
+        if remaining > 2000 and current_task:
             cold = self._load(self.cold_file)
             if cold:
-                if task_keywords:
-                    cold = [p for p in cold if any(kw.lower() in p.lower() for kw in task_keywords)]
-                if cold:
+                # Filter by relevance
+                similarities = self.semantic.batch_similarities(current_task, cold)
+                relevant_points = [p for p, s in zip(cold, similarities) if s > 0.15][-20:]
+                
+                if relevant_points:
                     cold_text = "\n## Key Learnings\n"
-                    cold_text += '\n'.join(f"- {p}" for p in cold[-20:])
-                    parts.append(cold_text)
+                    cold_text += '\n'.join(f"- {p}" for p in relevant_points)
+                    
+                    if len(cold_text) <= remaining:
+                        parts.append(cold_text)
         
         return '\n'.join(parts)
     
     def add_permanent(self, point: str):
-        """Add point directly to cold storage."""
+        """Add directly to cold storage."""
         cold = self._load(self.cold_file)
         point = point.strip()
         if point and point not in cold:
             cold.append(point)
-            cold = cold[-self.cold_limit:]
+            cold = cold[-MAX_COLD_MEMORY:]
             self._save(self.cold_file, cold)
     
-    def compact_cold(self, semantic: 'SemanticSearch', threshold: float = SEMANTIC_COMPACT_THRESHOLD):
-        """Compact cold storage by removing near-duplicates."""
+    def compact(self, semantic: SemanticSearch):
+        """Compact all tiers, removing near-duplicates."""
+        # Compact cold storage
         cold = self._load(self.cold_file)
-        if len(cold) < 50:
-            return  # Not enough to compact
+        if len(cold) < 30:
+            return
         
-        # Find unique entries
         unique = []
         for point in cold:
-            if not unique:
-                unique.append(point)
-            elif not semantic.is_duplicate(point, unique, threshold=threshold):
+            if not unique or not semantic.is_duplicate(point, unique, threshold=SEMANTIC_COMPACT_THRESHOLD):
                 unique.append(point)
         
         if len(unique) < len(cold):
-            log(f"Memory compaction: {len(cold)} -> {len(unique)} points")
+            log(f"Memory compaction: {len(cold)} -> {len(unique)} cold points")
             self._save(self.cold_file, unique)
+        
+        # Compact warm storage summaries
+        warm = self._load(self.warm_file)
+        if len(warm) > MAX_WARM_MEMORY:
+            self._save(self.warm_file, warm[-MAX_WARM_MEMORY:])
+    
+    def get_stats(self) -> dict:
+        """Get memory statistics."""
+        return {
+            "hot": len(self._load(self.hot_file)),
+            "warm": len(self._load(self.warm_file)),
+            "cold": len(self._load(self.cold_file))
+        }
 
 
 # =============================================================================
-# LEARNINGS MANAGER - Deduplication
+# LEARNINGS MANAGER - With hard limits and smart compaction
 # =============================================================================
 
 class LearningsManager:
-    """Manage learnings with deduplication."""
+    """Manage learnings with strict limits and semantic deduplication."""
     
     def __init__(self, semantic: SemanticSearch):
         self.semantic = semantic
-        self._entries = []
+        self._entries: List[Dict] = []
         self._load()
     
     def _load(self):
+        """Load learnings with metadata."""
         if not LEARNINGS_FILE.exists():
             return
+        
         content = LEARNINGS_FILE.read_text()
-        sections = re.split(r'\n(?=###?\s)', content)
-        self._entries = [s.strip() for s in sections if s.strip()]
-    
-    def add(self, learning: str) -> bool:
-        """Add learning if not duplicate."""
-        learning = learning.strip()
-        if not learning:
-            return False
+        sections = re.split(r'\n(?=##\s)', content)
         
-        if self._entries and self.semantic.is_duplicate(learning, self._entries, threshold=SEMANTIC_DUPLICATE_THRESHOLD):
-            return False
-        
-        self._entries.append(learning)
-        self._save()
-        return True
+        self._entries = []
+        for section in sections:
+            section = section.strip()
+            if not section:
+                continue
+            
+            # Try to extract iteration number
+            match = re.search(r'Iteration (\d+)', section)
+            iteration = int(match.group(1)) if match else 0
+            
+            self._entries.append({
+                'content': section,
+                'iteration': iteration,
+                'timestamp': datetime.now().isoformat()
+            })
     
     def _save(self):
-        content = '\n\n'.join(self._entries)
+        """Save learnings to file."""
+        content = '\n\n'.join(e['content'] for e in self._entries)
         try:
             LEARNINGS_FILE.write_text(content)
             os.chmod(LEARNINGS_FILE, 0o666)
         except Exception as e:
             log_error(f"Failed to save learnings: {e}")
     
-    def get_relevant(self, query: str, max_chars: int = 15000) -> str:
+    def add(self, learning: str, iteration: int = 0) -> bool:
+        """Add learning if not duplicate. Returns True if added."""
+        learning = learning.strip()
+        if not learning:
+            return False
+        
+        # Check for semantic duplicates
+        existing_texts = [e['content'] for e in self._entries]
+        if existing_texts and self.semantic.is_duplicate(learning, existing_texts, threshold=SEMANTIC_DUPLICATE_THRESHOLD):
+            log_debug(f"Skipped duplicate learning")
+            return False
+        
+        # Format with metadata
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        formatted = f"## Iteration {iteration} ({timestamp})\n{learning}"
+        
+        self._entries.append({
+            'content': formatted,
+            'iteration': iteration,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Check hard limit
+        if len(self._entries) > MAX_LEARNINGS_ENTRIES:
+            self._compact()
+        
+        self._save()
+        return True
+    
+    def _compact(self):
+        """Compact learnings when over limit."""
+        log(f"Compacting learnings: {len(self._entries)} entries")
+        
+        # Always keep newest 50
+        keep_recent = self._entries[-50:]
+        candidates = self._entries[:-50]
+        
+        if not candidates:
+            return
+        
+        # Score candidates by uniqueness
+        unique = []
+        texts_so_far = [e['content'] for e in keep_recent]
+        
+        for entry in candidates:
+            if not self.semantic.is_duplicate(entry['content'], texts_so_far, threshold=0.70):
+                unique.append(entry)
+                texts_so_far.append(entry['content'])
+        
+        # Keep most unique up to limit
+        max_old = MAX_LEARNINGS_ENTRIES - len(keep_recent)
+        self._entries = unique[-max_old:] + keep_recent
+        
+        log(f"Compacted to {len(self._entries)} entries")
+        self._save()
+    
+    def get_relevant(self, query: str, max_chars: int = LEARNINGS_LIMIT) -> str:
+        """Get relevant learnings for query."""
         if not self._entries:
             return ""
-        return self.semantic.select_relevant(query, self._entries, max_chars)
+        
+        texts = [e['content'] for e in self._entries]
+        similarities = self.semantic.batch_similarities(query, texts)
+        
+        # Sort by relevance
+        scored = list(zip(self._entries, similarities))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        
+        # Build result within budget
+        result = []
+        chars = 0
+        
+        for entry, score in scored:
+            if score < SEMANTIC_RELEVANCE_THRESHOLD:
+                continue
+            content = entry['content']
+            if chars + len(content) > max_chars:
+                break
+            result.append(content)
+            chars += len(content)
+        
+        return '\n\n'.join(result)
     
-    def get_all(self) -> str:
-        return '\n\n'.join(self._entries)
+    def get_all(self, max_chars: int = LEARNINGS_LIMIT) -> str:
+        """Get all learnings within limit."""
+        result = []
+        chars = 0
+        
+        for entry in reversed(self._entries):  # Newest first
+            content = entry['content']
+            if chars + len(content) > max_chars:
+                break
+            result.append(content)
+            chars += len(content)
+        
+        return '\n\n'.join(reversed(result))
     
     def count(self) -> int:
         return len(self._entries)
 
 
 # =============================================================================
-# CONTEXT CONDENSER
+# CONTEXT CONDENSER - Enhanced with semantic verification
 # =============================================================================
 
 class ContextCondenser:
-    """Condense context with verification."""
+    """Condense context with semantic verification."""
     
     def __init__(self, semantic: SemanticSearch):
         self.semantic = semantic
-        self.condense_history_file = RALPH_DIR / "condense_history.json"
-        self.last_condense_iteration = 0
+        self.history_file = RALPH_DIR / "condense_history.json"
+        self.last_iteration = 0
         self._load_state()
     
     def _load_state(self):
-        if self.condense_history_file.exists():
-            try:
-                history = json.loads(self.condense_history_file.read_text())
-                self.last_condense_iteration = history.get('last_iteration', 0)
-            except Exception:
-                pass
+        history = safe_read_json(self.history_file, {})
+        self.last_iteration = history.get('last_iteration', 0)
     
     def _save_state(self, iteration: int):
-        history = {
+        atomic_write_json(self.history_file, {
             'last_iteration': iteration,
             'timestamp': datetime.now().isoformat()
-        }
-        try:
-            self.condense_history_file.write_text(json.dumps(history, indent=2))
-            os.chmod(self.condense_history_file, 0o666)
-        except Exception:
-            pass
-        self.last_condense_iteration = iteration
+        })
+        self.last_iteration = iteration
     
     def should_condense(self, iteration: int, config: dict, 
                         context_size: int = 0, next_is_architect: bool = False) -> Tuple[bool, str]:
-        """Check if condensation should run."""
-        condense_interval = config.get('condenseInterval', 15)
-        if condense_interval <= 0:
+        """Check if condensation needed."""
+        interval = config.get('condenseInterval', COMPACT_INTERVAL)
+        if interval <= 0:
             return False, "disabled"
         
-        iterations_since = iteration - self.last_condense_iteration
+        since_last = iteration - self.last_iteration
         
-        if iterations_since >= condense_interval:
-            return True, f"interval ({iterations_since} iterations)"
+        if since_last >= interval:
+            return True, f"interval ({since_last} iters)"
         
-        if config.get('condenseBeforeArchitect', True) and next_is_architect and iterations_since >= 5:
+        if config.get('condenseBeforeArchitect', True) and next_is_architect and since_last >= 5:
             return True, "before architect"
         
-        if context_size > CONTEXT_SIZE_LIMIT:
+        # Context size trigger - using our budget
+        if context_size > CONTEXT_BUDGET_CHARS * 0.8:
             return True, f"context size ({context_size} chars)"
         
         return False, ""
     
+    def extract_critical_facts(self, content: str) -> List[Dict]:
+        """Extract facts that must be preserved."""
+        facts = []
+        
+        # Errors with context
+        for match in re.finditer(r'(?:error|failed|exception|bug|fix|crash)[:\s]+([^\n]{20,200})', content, re.I):
+            facts.append({'type': 'ERROR', 'content': match.group(1).strip()})
+        
+        # Decisions
+        for match in re.finditer(r'(?:decided|chose|because|will use|using)[:\s]+([^\n]{20,200})', content, re.I):
+            facts.append({'type': 'DECISION', 'content': match.group(1).strip()})
+        
+        # Completions
+        for match in re.finditer(r'(?:completed|finished|done|implemented)[:\s]+([^\n]{10,150})', content, re.I):
+            facts.append({'type': 'COMPLETED', 'content': match.group(1).strip()})
+        
+        # Architecture changes
+        for match in re.finditer(r'(?:created|added|modified|changed|refactored)[:\s]+([^\n]{10,150})', content, re.I):
+            facts.append({'type': 'CHANGE', 'content': match.group(1).strip()})
+        
+        # Deduplicate
+        seen = set()
+        unique = []
+        for fact in facts:
+            key = fact['content'].lower()[:50]
+            if key not in seen:
+                seen.add(key)
+                unique.append(fact)
+        
+        return unique[:30]  # Limit to 30 facts
+    
+    def verify_condensation(self, original: str, condensed: str) -> Tuple[bool, List[Dict]]:
+        """Verify critical facts preserved using SEMANTIC similarity."""
+        facts = self.extract_critical_facts(original)
+        if not facts:
+            return True, []
+        
+        missing = []
+        preserved = 0
+        
+        for fact in facts:
+            fact_text = f"{fact['type']}: {fact['content']}"
+            
+            # Use semantic similarity instead of keyword matching
+            similarity = self.semantic.compute_similarity(fact_text, condensed)
+            
+            if similarity >= SEMANTIC_CONDENSE_VERIFY:
+                preserved += 1
+            else:
+                missing.append(fact)
+        
+        # Require 80% preservation (was 70%)
+        is_valid = (preserved / len(facts)) >= 0.80 if facts else True
+        
+        log(f"Condense verification: {preserved}/{len(facts)} facts preserved")
+        return is_valid, missing
+    
+    def save_condensed(self, iteration: int, condensed: str, original: str = ""):
+        """Save condensed context with auto-recovery of missing facts."""
+        
+        if original:
+            is_valid, missing = self.verify_condensation(original, condensed)
+            
+            if missing:
+                # Auto-append missing critical facts
+                condensed += "\n\n## Auto-Preserved Critical Facts\n"
+                for fact in missing[:15]:
+                    condensed += f"- [{fact['type']}] {fact['content']}\n"
+                log(f"Auto-preserved {len(missing)} missing facts")
+        
+        # Backup old
+        if CONDENSED_FILE.exists():
+            backup_dir = RALPH_DIR / "condense_backups"
+            backup_dir.mkdir(exist_ok=True)
+            backup = backup_dir / f"condensed_{self.last_iteration}.md"
+            try:
+                shutil.copy2(CONDENSED_FILE, backup)
+                # Keep last 3 backups only
+                for old in sorted(backup_dir.glob("condensed_*.md"))[:-3]:
+                    old.unlink()
+            except Exception:
+                pass
+        
+        # Save new
+        header = f"# Condensed Context (Iteration {iteration})\n"
+        header += f"# Generated: {datetime.now().isoformat()}\n\n"
+        
+        try:
+            CONDENSED_FILE.write_text(header + condensed)
+            os.chmod(CONDENSED_FILE, 0o666)
+            self._save_state(iteration)
+            log(f"Saved condensed: {len(condensed)} chars")
+        except Exception as e:
+            log_error(f"Failed to save condensed: {e}")
+    
+    def get_condensed(self) -> str:
+        if CONDENSED_FILE.exists():
+            return CONDENSED_FILE.read_text()
+        return ""
+    
     def parse_condensed(self, output: str) -> Optional[str]:
-        """Extract condensed context from output."""
+        """Extract condensed content from output."""
         match = re.search(r'```condensed\s*\n(.*?)\n```', output, re.DOTALL)
         if match:
             return match.group(1).strip()
@@ -717,351 +906,469 @@ class ContextCondenser:
             return output[idx:].strip()
         
         return None
+
+
+# =============================================================================
+# DIVERGENCE DETECTOR - NEW: Detect circular patterns
+# =============================================================================
+
+class DivergenceDetector:
+    """
+    Detect when agent is stuck in circular patterns.
     
-    def extract_critical_facts(self, content: str) -> List[str]:
-        """Extract critical facts that must be preserved."""
-        facts = []
-        
-        # Errors
-        for match in re.findall(r'(?:error|failed|exception|bug|fix)[:\s]+([^\n]{20,200})', content, re.I)[:10]:
-            facts.append(f"ERROR: {match.strip()}")
-        
-        # Decisions
-        for match in re.findall(r'(?:decided|chose|because)[:\s]+([^\n]{20,200})', content, re.I)[:10]:
-            facts.append(f"DECISION: {match.strip()}")
-        
-        # Completions
-        for match in re.findall(r'(?:completed|finished|done)[:\s]+([^\n]{10,150})', content, re.I)[:10]:
-            facts.append(f"COMPLETED: {match.strip()}")
-        
-        return facts
+    Signals:
+    - High similarity between recent iterations
+    - Same errors repeating
+    - No task progress despite activity
+    """
     
-    def verify_condensation(self, original: str, condensed: str) -> Tuple[bool, List[str]]:
-        """Verify critical facts are preserved."""
-        facts = self.extract_critical_facts(original)
-        if not facts:
-            return True, []
+    def __init__(self, semantic: SemanticSearch):
+        self.semantic = semantic
+        self.history_file = RALPH_DIR / "divergence_history.json"
+        self.recent_outputs: deque = deque(maxlen=DIVERGENCE_CHECK_WINDOW)
+    
+    def record_iteration(self, iteration: int, output_summary: str, outcome: str):
+        """Record iteration for pattern detection."""
+        self.recent_outputs.append({
+            'iteration': iteration,
+            'summary': output_summary[:1000],
+            'outcome': outcome,
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    def check_divergence(self) -> Tuple[bool, str, str]:
+        """
+        Check for circular patterns.
+        Returns: (is_diverging, reason, suggested_action)
+        """
+        if len(self.recent_outputs) < 5:
+            return False, "", ""
         
-        missing = []
-        preserved = 0
-        condensed_lower = condensed.lower()
+        outputs = list(self.recent_outputs)
         
-        for fact in facts:
-            fact_content = fact.split(':', 1)[-1].strip().lower()
-            key_words = [w for w in fact_content.split() if len(w) > 4][:5]
+        # Check 1: High similarity between consecutive iterations
+        similarities = []
+        for i in range(len(outputs) - 1):
+            sim = self.semantic.compute_similarity(
+                outputs[i]['summary'],
+                outputs[i + 1]['summary']
+            )
+            similarities.append(sim)
+        
+        avg_similarity = sum(similarities) / len(similarities)
+        
+        if avg_similarity > SEMANTIC_DIVERGENCE_THRESHOLD:
+            # High similarity = potentially going in circles
+            # Check if there's actual progress
+            outcomes = [o['outcome'] for o in outputs]
+            progress_outcomes = ['task_done', 'verified_pass', 'planning_done']
+            has_progress = any(o in progress_outcomes for o in outcomes)
             
-            if sum(1 for w in key_words if w in condensed_lower) >= len(key_words) * 0.5:
-                preserved += 1
-            elif self.semantic.compute_similarity(fact, condensed) > 0.3:
-                preserved += 1
+            if not has_progress:
+                return True, f"circular_pattern (avg_sim={avg_similarity:.2f})", "force_new_approach"
+        
+        # Check 2: Same outcome repeating
+        outcomes = [o['outcome'] for o in outputs[-5:]]
+        if outcomes.count(outcomes[0]) >= 4 and outcomes[0] not in ['task_done', 'verified_pass']:
+            return True, f"repeated_outcome ({outcomes[0]} x{outcomes.count(outcomes[0])})", "escalate_to_architect"
+        
+        # Check 3: Error patterns
+        error_outputs = [o for o in outputs if 'error' in o['outcome'].lower() or 'fail' in o['outcome'].lower()]
+        if len(error_outputs) >= 4:
+            return True, f"repeated_errors ({len(error_outputs)}/{len(outputs)})", "rollback_and_rethink"
+        
+        return False, "", ""
+    
+    def get_pattern_summary(self) -> str:
+        """Get summary of recent patterns for self-reflection."""
+        if len(self.recent_outputs) < 3:
+            return "Not enough history for pattern analysis."
+        
+        outputs = list(self.recent_outputs)
+        outcomes = [o['outcome'] for o in outputs]
+        
+        summary = f"Last {len(outputs)} iterations:\n"
+        summary += f"- Outcomes: {', '.join(outcomes)}\n"
+        
+        # Count outcome types
+        from collections import Counter
+        counts = Counter(outcomes)
+        summary += f"- Distribution: {dict(counts)}\n"
+        
+        return summary
+    
+    def clear(self):
+        """Clear history after recovery."""
+        self.recent_outputs.clear()
+
+
+# =============================================================================
+# KNOWLEDGE DECAY - NEW: Forget old irrelevant information
+# =============================================================================
+
+class KnowledgeDecay:
+    """
+    Implement forgetting curve for old, irrelevant knowledge.
+    
+    Older knowledge that's not relevant to current work
+    should fade to prevent context pollution.
+    """
+    
+    def __init__(self, semantic: SemanticSearch):
+        self.semantic = semantic
+    
+    def decay_learnings(self, learnings: List[Dict], current_task: str, 
+                        current_iteration: int) -> List[Dict]:
+        """
+        Apply decay to learnings based on age and relevance.
+        Returns learnings that should be kept.
+        """
+        if not learnings or not current_task:
+            return learnings
+        
+        kept = []
+        
+        for entry in learnings:
+            content = entry.get('content', '')
+            iteration = entry.get('iteration', 0)
+            
+            # Calculate age in iterations
+            age = current_iteration - iteration
+            
+            # Calculate relevance to current task
+            relevance = self.semantic.compute_similarity(content, current_task)
+            
+            # Decay formula: keep if young OR relevant
+            # - Recent (< 20 iters): always keep
+            # - Medium (20-50 iters): keep if relevance > 0.3
+            # - Old (50-100 iters): keep if relevance > 0.5
+            # - Very old (> 100 iters): keep only if very relevant (> 0.6)
+            
+            should_keep = False
+            
+            if age < 20:
+                should_keep = True
+            elif age < 50:
+                should_keep = relevance > 0.25
+            elif age < 100:
+                should_keep = relevance > 0.40
             else:
-                missing.append(fact)
+                should_keep = relevance > 0.55
+            
+            if should_keep:
+                kept.append(entry)
         
-        is_valid = (preserved / len(facts)) >= 0.7 if facts else True
-        return is_valid, missing
+        if len(kept) < len(learnings):
+            log(f"Knowledge decay: {len(learnings)} -> {len(kept)} entries")
+        
+        return kept
     
-    def save_condensed(self, iteration: int, condensed: str, original: str = ""):
-        """Save condensed context with verification."""
-        # Verify if original provided
-        if original:
-            is_valid, missing = self.verify_condensation(original, condensed)
-            if not is_valid and missing:
-                condensed += "\n\n## Critical Facts (auto-preserved)\n"
-                for fact in missing[:20]:
-                    condensed += f"- {fact}\n"
-                log(f"Added {len(missing)} missing facts to condensed")
+    def decay_memory_points(self, points: List[str], current_task: str) -> List[str]:
+        """Apply decay to cold memory points."""
+        if not points or not current_task:
+            return points
         
-        # Backup old
-        if CONDENSED_FILE.exists():
-            backup_dir = RALPH_DIR / "condense_backups"
-            backup_dir.mkdir(exist_ok=True)
-            backup_file = backup_dir / f"condensed_{self.last_condense_iteration}.md"
+        similarities = self.semantic.batch_similarities(current_task, points)
+        
+        # Keep points with any relevance, or if they're about errors/decisions
+        kept = []
+        for point, sim in zip(points, similarities):
+            is_important = any(kw in point.lower() for kw in ['error', 'bug', 'fix', 'decision', 'must', 'never', 'always'])
+            if sim > 0.1 or is_important:
+                kept.append(point)
+        
+        return kept
+
+
+# =============================================================================
+# SELF REFLECTION - NEW: Periodic self-assessment
+# =============================================================================
+
+class SelfReflection:
+    """
+    Periodic self-reflection for the agent.
+    
+    Every N iterations, agent assesses:
+    - Am I making progress?
+    - Am I going in circles?
+    - What should I remember/forget?
+    """
+    
+    def __init__(self, semantic: SemanticSearch):
+        self.semantic = semantic
+        REFLECTION_DIR.mkdir(exist_ok=True)
+        self.history_file = REFLECTION_DIR / "reflections.json"
+        self.last_reflection = 0
+        self._load()
+    
+    def _load(self):
+        data = safe_read_json(self.history_file, {})
+        self.last_reflection = data.get('last_iteration', 0)
+    
+    def _save(self, iteration: int):
+        atomic_write_json(self.history_file, {
+            'last_iteration': iteration,
+            'timestamp': datetime.now().isoformat()
+        })
+        self.last_reflection = iteration
+    
+    def should_reflect(self, iteration: int) -> bool:
+        """Check if reflection is due."""
+        return (iteration - self.last_reflection) >= REFLECTION_INTERVAL
+    
+    def get_reflection_prompt(self, memory: HierarchicalMemory, 
+                              divergence: DivergenceDetector,
+                              learnings_count: int,
+                              iteration: int) -> str:
+        """Build self-reflection prompt."""
+        
+        stats = memory.get_stats()
+        pattern_summary = divergence.get_pattern_summary()
+        
+        prompt = f"""# Self-Reflection Checkpoint - Iteration {iteration}
+
+## Current State
+- Memory: {stats['hot']} hot, {stats['warm']} warm, {stats['cold']} cold entries
+- Learnings: {learnings_count} entries
+- Iterations since last reflection: {iteration - self.last_reflection}
+
+## Recent Pattern Analysis
+{pattern_summary}
+
+## Your Task
+Analyze your recent work and answer:
+
+1. **Progress Assessment**: Are you making meaningful progress? (good/stuck/diverging)
+
+2. **Pattern Detection**: Do you see any circular patterns or repeated mistakes?
+
+3. **Knowledge Quality**: Is your context helping or hurting? What's noise vs signal?
+
+4. **Strategy Review**: Should you change your approach?
+
+## Output Format
+```reflection
+PROGRESS: [good/stuck/diverging]
+PATTERNS: [description of any patterns noticed]
+PRESERVE: [list critical knowledge that MUST be kept]
+FORGET: [list noise that can be removed]
+STRATEGY: [any strategy changes needed]
+```
+"""
+        return prompt
+    
+    def parse_reflection(self, output: str) -> Dict:
+        """Parse reflection output."""
+        result = {
+            'progress': 'unknown',
+            'patterns': '',
+            'preserve': [],
+            'forget': [],
+            'strategy': ''
+        }
+        
+        # Extract from code block
+        match = re.search(r'```reflection\s*\n(.*?)\n```', output, re.DOTALL)
+        if not match:
+            return result
+        
+        content = match.group(1)
+        
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('PROGRESS:'):
+                result['progress'] = line.split(':', 1)[1].strip().lower()
+            elif line.startswith('PATTERNS:'):
+                result['patterns'] = line.split(':', 1)[1].strip()
+            elif line.startswith('PRESERVE:'):
+                items = line.split(':', 1)[1].strip()
+                result['preserve'] = [i.strip() for i in items.split(',') if i.strip()]
+            elif line.startswith('FORGET:'):
+                items = line.split(':', 1)[1].strip()
+                result['forget'] = [i.strip() for i in items.split(',') if i.strip()]
+            elif line.startswith('STRATEGY:'):
+                result['strategy'] = line.split(':', 1)[1].strip()
+        
+        return result
+    
+    def save_reflection(self, iteration: int, reflection: Dict):
+        """Save reflection results."""
+        reflection_file = REFLECTION_DIR / f"reflection_{iteration:04d}.json"
+        reflection['iteration'] = iteration
+        reflection['timestamp'] = datetime.now().isoformat()
+        atomic_write_json(reflection_file, reflection)
+        self._save(iteration)
+        
+        # Keep only last 10 reflections
+        for old in sorted(REFLECTION_DIR.glob("reflection_*.json"))[:-10]:
             try:
-                shutil.copy2(CONDENSED_FILE, backup_file)
-                # Keep only last 5 backups
-                backups = sorted(backup_dir.glob("condensed_*.md"))
-                for old in backups[:-5]:
-                    old.unlink()
+                old.unlink()
             except Exception:
                 pass
-        
-        # Save new
-        header = f"# Condensed Context (Iteration {iteration})\n"
-        header += f"# Generated: {datetime.now().isoformat()}\n\n"
-        try:
-            CONDENSED_FILE.write_text(header + condensed)
-            os.chmod(CONDENSED_FILE, 0o666)
-            self._save_state(iteration)
-            log(f"Saved condensed context: {len(condensed)} chars")
-        except Exception as e:
-            log_error(f"Failed to save condensed: {e}")
     
-    def get_condensed(self) -> str:
-        """Get current condensed context."""
-        if CONDENSED_FILE.exists():
-            return CONDENSED_FILE.read_text()
-        return ""
-    
-    def get_recent_iterations_summary(self, num_iterations: int = 15) -> str:
-        """Build summary of recent iterations."""
-        if not ITERATIONS_DIR.exists():
+    def get_last_reflection_summary(self) -> str:
+        """Get summary of last reflection for context."""
+        reflections = sorted(REFLECTION_DIR.glob("reflection_*.json"))
+        if not reflections:
             return ""
         
-        summaries = []
-        json_files = sorted(ITERATIONS_DIR.glob("iteration_*.json"))[-num_iterations:]
-        
-        for json_file in json_files:
-            try:
-                data = json.loads(json_file.read_text())
-                iter_num = data.get('iteration', '?')
-                iter_type = data.get('type', '?')
-                result = data.get('result', 'unknown')
-                summaries.append(f"### Iteration {iter_num} ({iter_type}): {result}")
-            except Exception:
-                continue
-        
-        return '\n\n'.join(summaries)
-
-
-# =============================================================================
-# METRICS - Track performance
-# =============================================================================
-
-class RalphMetrics:
-    """Track performance metrics for monitoring and optimization."""
-    
-    def __init__(self):
-        self.metrics_file = RALPH_DIR / "metrics.json"
-        self._metrics = self._load()
-    
-    def _load(self) -> dict:
-        if self.metrics_file.exists():
-            try:
-                return json.loads(self.metrics_file.read_text())
-            except Exception:
-                pass
-        return {
-            "total_iterations": 0,
-            "successful_iterations": 0,
-            "failed_iterations": 0,
-            "stuck_count": 0,
-            "condense_count": 0,
-            "total_time_seconds": 0,
-            "iteration_times": [],
-            "context_sizes": [],
-            "learnings_count": 0,
-            "learnings_dedupe_skipped": 0,
-            "started_at": None,
-            "last_updated": None
-        }
-    
-    def _save(self):
-        self._metrics["last_updated"] = datetime.now().isoformat()
         try:
-            self.metrics_file.write_text(json.dumps(self._metrics, indent=2))
-            os.chmod(self.metrics_file, 0o666)
+            data = json.loads(reflections[-1].read_text())
+            return f"""## Last Self-Reflection (Iteration {data.get('iteration', '?')})
+- Progress: {data.get('progress', '?')}
+- Patterns: {data.get('patterns', 'none')}
+- Strategy: {data.get('strategy', 'continue')}
+"""
         except Exception:
-            pass
-    
-    def record_iteration(self, success: bool, time_seconds: float, stuck: bool = False):
-        if self._metrics["started_at"] is None:
-            self._metrics["started_at"] = datetime.now().isoformat()
-        
-        self._metrics["total_iterations"] += 1
-        if success:
-            self._metrics["successful_iterations"] += 1
-        else:
-            self._metrics["failed_iterations"] += 1
-        
-        if stuck:
-            self._metrics["stuck_count"] += 1
-        
-        self._metrics["total_time_seconds"] += time_seconds
-        self._metrics["iteration_times"].append(time_seconds)
-        self._metrics["iteration_times"] = self._metrics["iteration_times"][-50:]
-        self._save()
-    
-    def record_condense(self):
-        self._metrics["condense_count"] += 1
-        self._save()
-    
-    def record_learning(self, added: bool, duplicate: bool = False):
-        if added:
-            self._metrics["learnings_count"] += 1
-        if duplicate:
-            self._metrics["learnings_dedupe_skipped"] += 1
-        self._save()
-    
-    def get_stats(self) -> dict:
-        m = self._metrics
-        total = m["total_iterations"]
-        return {
-            "total_iterations": total,
-            "success_rate": m["successful_iterations"] / total if total > 0 else 0,
-            "stuck_rate": m["stuck_count"] / total if total > 0 else 0,
-            "avg_time": sum(m["iteration_times"]) / len(m["iteration_times"]) if m["iteration_times"] else 0,
-            "condense_count": m["condense_count"],
-            "learnings": m["learnings_count"],
-            "dedupe_skipped": m["learnings_dedupe_skipped"]
-        }
-
-
-# =============================================================================
-# EPOCHS - Milestone snapshots for long projects
-# =============================================================================
-
-class EpochManager:
-    """Manage epoch snapshots for long-running projects."""
-    
-    def __init__(self):
-        self.epochs_dir = RALPH_DIR / "epochs"
-        self.epochs_dir.mkdir(exist_ok=True)
-    
-    def check_milestone(self, iteration: int) -> Optional[str]:
-        """Check if milestone reached. Returns reason or None."""
-        config = read_config()
-        last_epoch = config.get("lastEpochIteration", 0)
-        
-        # Don't save too frequently
-        if iteration - last_epoch < 25:
-            return None
-        
-        prd = read_prd()
-        stories = prd.get("userStories", [])
-        done = sum(1 for s in stories if s.get("passes"))
-        total = len(stories)
-        
-        # Check milestones
-        if iteration > 0 and iteration % 100 == 0:
-            return f"iteration_{iteration}"
-        
-        if total > 10:
-            if done >= total * 0.5 and not config.get("50pctEpochSaved"):
-                return "50pct_complete"
-            if done >= total * 0.75 and not config.get("75pctEpochSaved"):
-                return "75pct_complete"
-        
-        return None
-    
-    def save_epoch(self, iteration: int, reason: str) -> bool:
-        """Save epoch snapshot."""
-        config = read_config()
-        current_epoch = config.get("currentEpoch", 0) + 1
-        
-        try:
-            prd = read_prd()
-            stories = prd.get("userStories", [])
-            done = sum(1 for s in stories if s.get("passes"))
-            total = len(stories)
-            
-            completed_tasks = [s.get("title", "?") for s in stories if s.get("passes")][-20:]
-            
-            epoch_data = {
-                "epoch": current_epoch,
-                "iteration": iteration,
-                "reason": reason,
-                "timestamp": datetime.now().isoformat(),
-                "progress": {"done": done, "total": total},
-                "phase": prd.get("phase", "unknown"),
-                "verified": prd.get("verified", False),
-                "recentTasks": completed_tasks
-            }
-            
-            # Save epoch
-            epoch_file = self.epochs_dir / f"epoch_{current_epoch:03d}.json"
-            epoch_file.write_text(json.dumps(epoch_data, indent=2))
-            os.chmod(epoch_file, 0o666)
-            
-            # Update config
-            update_config("currentEpoch", current_epoch)
-            update_config("lastEpochIteration", iteration)
-            
-            # Mark milestone flags
-            if "50pct" in reason:
-                update_config("50pctEpochSaved", True)
-            if "75pct" in reason:
-                update_config("75pctEpochSaved", True)
-            
-            log(f"Saved epoch {current_epoch}: {reason}")
-            return True
-            
-        except Exception as e:
-            log_error(f"Failed to save epoch: {e}")
-            return False
-    
-    def get_epoch_context(self, max_epochs: int = 3) -> str:
-        """Get context from recent epochs."""
-        epoch_files = sorted(self.epochs_dir.glob("epoch_*.json"))[-max_epochs:]
-        
-        if not epoch_files:
             return ""
-        
-        parts = ["## Project Milestones"]
-        for f in epoch_files:
-            try:
-                data = json.loads(f.read_text())
-                parts.append(f"- Epoch {data['epoch']} (iter {data['iteration']}): {data['reason']}")
-                parts.append(f"  Progress: {data['progress']['done']}/{data['progress']['total']}")
-            except Exception:
-                continue
-        
-        return '\n'.join(parts)
 
 
 # =============================================================================
-# STUCK DETECTOR - Detects when stuck and triggers recovery
+# ADAPTIVE CONTEXT - NEW: Smart context selection
+# =============================================================================
+
+class AdaptiveContext:
+    """
+    Intelligently select context based on current task.
+    
+    Instead of fixed limits, allocate budget by relevance.
+    """
+    
+    def __init__(self, semantic: SemanticSearch):
+        self.semantic = semantic
+    
+    def build_context(self, 
+                      current_task: str,
+                      mission: str,
+                      architecture: str,
+                      learnings: str,
+                      memory_context: str,
+                      reflection_summary: str,
+                      guardrails: str,
+                      budget_chars: int = CONTEXT_BUDGET_CHARS) -> Dict[str, str]:
+        """
+        Build optimized context within budget.
+        
+        Priority order:
+        1. Current task (always full)
+        2. Guardrails (critical constraints)
+        3. Relevant learnings (errors, decisions)
+        4. Architecture (relevant parts)
+        5. Memory (relevant history)
+        6. Mission (compressed if needed)
+        7. Reflection (if space)
+        """
+        
+        result = {}
+        remaining = budget_chars
+        
+        # 1. Guardrails - critical, always include
+        if guardrails:
+            guardrails_budget = min(len(guardrails), GUARDRAILS_LIMIT)
+            result['guardrails'] = guardrails[:guardrails_budget]
+            remaining -= len(result['guardrails'])
+        
+        # 2. Learnings - prioritize error-related
+        if learnings and remaining > 20000:
+            learnings_budget = min(len(learnings), LEARNINGS_LIMIT, remaining // 3)
+            result['learnings'] = self._select_relevant(learnings, current_task, learnings_budget)
+            remaining -= len(result['learnings'])
+        
+        # 3. Architecture - relevant parts
+        if architecture and remaining > 15000:
+            arch_budget = min(len(architecture), ARCHITECTURE_LIMIT, remaining // 4)
+            result['architecture'] = self._select_relevant(architecture, current_task, arch_budget)
+            remaining -= len(result['architecture'])
+        
+        # 4. Memory context
+        if memory_context and remaining > 10000:
+            mem_budget = min(len(memory_context), MEMORY_CONTEXT_LIMIT, remaining // 4)
+            result['memory'] = memory_context[:mem_budget]
+            remaining -= len(result['memory'])
+        
+        # 5. Mission - compress if needed
+        if mission and remaining > 5000:
+            mission_budget = min(len(mission), MISSION_LIMIT, remaining // 3)
+            result['mission'] = mission[:mission_budget]
+            remaining -= len(result['mission'])
+        
+        # 6. Reflection summary if space
+        if reflection_summary and remaining > 2000:
+            result['reflection'] = reflection_summary[:min(len(reflection_summary), remaining)]
+            remaining -= len(result['reflection'])
+        
+        return result
+    
+    def _select_relevant(self, content: str, query: str, budget: int) -> str:
+        """Select relevant parts of content within budget."""
+        if len(content) <= budget:
+            return content
+        
+        # Split into sections
+        sections = re.split(r'\n(?=##?\s)', content)
+        if len(sections) <= 1:
+            return content[:budget]
+        
+        # Score sections by relevance
+        similarities = self.semantic.batch_similarities(query, sections)
+        scored = list(zip(sections, similarities))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        
+        # Build result
+        result = []
+        chars = 0
+        
+        for section, score in scored:
+            if chars + len(section) > budget:
+                continue
+            result.append((sections.index(section), section))  # Keep original order
+            chars += len(section)
+        
+        # Sort by original order
+        result.sort(key=lambda x: x[0])
+        return '\n\n'.join(s for _, s in result)
+
+
+# =============================================================================
+# STUCK DETECTOR - Enhanced
 # =============================================================================
 
 class StuckDetector:
-    """
-    Detects when Ralph is stuck and triggers recovery.
-    
-    Stuck conditions:
-    - Same task attempted 3+ times
-    - Same error repeated 5+ times
-    - No progress for 10+ iterations
-    - Verification failed 3+ times in a row
-    """
+    """Enhanced stuck detection with better recovery."""
     
     def __init__(self):
         self.stuck_file = RALPH_DIR / "stuck_history.json"
         self.max_task_attempts = 3
-        self.max_same_errors = 5
-        self.max_no_progress = 10
-        self.max_verification_fails = 3
+        self.max_same_errors = 4
+        self.max_no_progress = 8
     
     def check_stuck(self, current_task_id: str, iteration: int) -> Tuple[bool, str]:
-        """Check if we're stuck. Returns (is_stuck, reason)."""
+        """Check if stuck."""
         history = self._load_history()
         
-        # Check task attempts
-        task_attempts = [h for h in history if h.get('task_id') == current_task_id]
+        # Task attempts
+        task_attempts = [h for h in history if h.get('task_id') == current_task_id and not h.get('completed')]
         if len(task_attempts) >= self.max_task_attempts:
-            return True, f"Task {current_task_id} attempted {len(task_attempts)} times"
+            return True, f"Task {current_task_id} failed {len(task_attempts)} times"
         
-        # Check same error
+        # Same error
         recent_errors = [h.get('error', '') for h in history[-self.max_same_errors:] if h.get('error')]
-        if len(recent_errors) >= self.max_same_errors and len(set(recent_errors)) == 1:
-            return True, f"Same error repeated {len(recent_errors)} times"
+        if len(recent_errors) >= self.max_same_errors:
+            unique_errors = set(e[:50] for e in recent_errors)
+            if len(unique_errors) == 1:
+                return True, f"Same error {len(recent_errors)} times"
         
-        # Check no progress
+        # No progress
         recent = history[-self.max_no_progress:]
         if len(recent) >= self.max_no_progress:
             completed = sum(1 for h in recent if h.get('completed'))
             if completed == 0:
-                return True, f"No task completed in last {self.max_no_progress} iterations"
-        
-        # Check verification failures
-        recent_verifications = [h for h in history[-10:] if h.get('type') == 'verification']
-        failed = [v for v in recent_verifications if not v.get('passed')]
-        if len(failed) >= self.max_verification_fails:
-            return True, f"Verification failed {len(failed)} times in a row"
+                return True, f"No progress in {self.max_no_progress} iterations"
         
         return False, ""
     
     def record_attempt(self, task_id: str, iteration: int, completed: bool,
                        error: Optional[str] = None, attempt_type: str = 'worker'):
-        """Record a task attempt."""
         history = self._load_history()
         history.append({
             'task_id': task_id,
@@ -1071,28 +1378,19 @@ class StuckDetector:
             'type': attempt_type,
             'timestamp': datetime.now().isoformat()
         })
-        history = history[-100:]  # Keep last 100
+        history = history[-100:]
         self._save_history(history)
     
     def get_recovery_strategy(self, reason: str) -> str:
-        """
-        Determine recovery strategy:
-        - skip_task: Skip current task, mark as blocked
-        - rollback: Rollback recent changes
-        - escalate: Add architect review task
-        """
-        if 'attempted' in reason:
+        if 'failed' in reason.lower():
             return 'skip_task'
-        elif 'error repeated' in reason:
+        elif 'error' in reason.lower():
             return 'rollback'
-        elif 'No task completed' in reason:
+        elif 'progress' in reason.lower():
             return 'escalate'
-        elif 'Verification failed' in reason:
-            return 'rollback'
         return 'skip_task'
     
     def get_task_attempts(self, task_id: str) -> str:
-        """Get formatted history of previous attempts."""
         history = self._load_history()
         attempts = [h for h in history if h.get('task_id') == task_id and not h.get('completed')]
         
@@ -1106,240 +1404,281 @@ class StuckDetector:
         return '\n'.join(lines)
     
     def clear_history(self):
-        """Clear history after successful recovery."""
         self._save_history([])
     
     def _load_history(self) -> List[dict]:
-        if self.stuck_file.exists():
-            try:
-                return json.loads(self.stuck_file.read_text())
-            except Exception:
-                return []
-        return []
+        return safe_read_json(self.stuck_file, [])
     
     def _save_history(self, history: List[dict]):
-        try:
-            self.stuck_file.write_text(json.dumps(history, indent=2, ensure_ascii=False))
-            os.chmod(self.stuck_file, 0o666)
-        except Exception:
-            pass
+        atomic_write_json(self.stuck_file, history)
 
 
 # =============================================================================
-# CIRCUIT BREAKER - Resilience for external services
+# METRICS
 # =============================================================================
 
-class CircuitBreaker:
-    """
-    Circuit breaker pattern for external services.
+class RalphMetrics:
+    """Track performance metrics."""
     
-    States:
-    - CLOSED: normal operation
-    - OPEN: failing, reject requests
-    - HALF_OPEN: testing if recovered
-    """
+    def __init__(self):
+        self.metrics_file = RALPH_DIR / "metrics.json"
+        self._metrics = self._load()
     
-    def __init__(self, name: str, failure_threshold: int = 3,
-                 recovery_timeout: float = 60.0):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
+    def _load(self) -> dict:
+        return safe_read_json(self.metrics_file, {
+            "total_iterations": 0,
+            "successful": 0,
+            "failed": 0,
+            "stuck_count": 0,
+            "condense_count": 0,
+            "reflection_count": 0,
+            "divergence_detected": 0,
+            "iteration_times": [],
+            "started_at": None
+        })
+    
+    def _save(self):
+        self._metrics["last_updated"] = datetime.now().isoformat()
+        atomic_write_json(self.metrics_file, self._metrics)
+    
+    def record_iteration(self, success: bool, time_seconds: float, stuck: bool = False):
+        if self._metrics["started_at"] is None:
+            self._metrics["started_at"] = datetime.now().isoformat()
         
-        self.failures = 0
-        self.state = "CLOSED"
-        self.last_failure_time = 0.0
-    
-    def can_proceed(self) -> bool:
-        """Check if request can proceed."""
-        if self.state == "CLOSED":
-            return True
-        
-        if self.state == "OPEN":
-            if time.time() - self.last_failure_time >= self.recovery_timeout:
-                self.state = "HALF_OPEN"
-                log(f"Circuit {self.name}: OPEN -> HALF_OPEN")
-                return True
-            return False
-        
-        return True  # HALF_OPEN allows
-    
-    def record_success(self):
-        """Record successful call."""
-        if self.state == "HALF_OPEN":
-            self.state = "CLOSED"
-            self.failures = 0
-            log(f"Circuit {self.name}: HALF_OPEN -> CLOSED (recovered)")
+        self._metrics["total_iterations"] += 1
+        if success:
+            self._metrics["successful"] += 1
         else:
-            self.failures = 0
-    
-    def record_failure(self, error: str = ""):
-        """Record failed call."""
-        self.failures += 1
-        self.last_failure_time = time.time()
+            self._metrics["failed"] += 1
+        if stuck:
+            self._metrics["stuck_count"] += 1
         
-        if self.state == "HALF_OPEN":
-            self.state = "OPEN"
-            log(f"Circuit {self.name}: HALF_OPEN -> OPEN (still failing)")
-        elif self.failures >= self.failure_threshold:
-            self.state = "OPEN"
-            log(f"Circuit {self.name}: CLOSED -> OPEN (threshold reached)")
+        self._metrics["iteration_times"].append(time_seconds)
+        self._metrics["iteration_times"] = self._metrics["iteration_times"][-50:]
+        self._save()
+    
+    def record_condense(self):
+        self._metrics["condense_count"] += 1
+        self._save()
+    
+    def record_reflection(self):
+        self._metrics["reflection_count"] += 1
+        self._save()
+    
+    def record_divergence(self):
+        self._metrics["divergence_detected"] += 1
+        self._save()
 
 
 # =============================================================================
-# DISK SPACE MONITOR - Cleanup when low space
+# DISK MONITOR
 # =============================================================================
-
-MIN_FREE_SPACE_MB = 500  # Minimum free space before cleanup
 
 class DiskSpaceMonitor:
-    """Monitors disk space and triggers cleanup."""
+    """Monitor and cleanup disk space."""
     
-    def get_free_space_mb(self) -> float:
-        """Get free disk space in MB."""
+    def get_free_mb(self) -> float:
         try:
             stat = os.statvfs(RALPH_DIR)
-            free_bytes = stat.f_bavail * stat.f_frsize
-            return free_bytes / (1024 * 1024)
+            return (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
         except Exception:
             return float('inf')
     
-    def is_low_space(self) -> bool:
-        return self.get_free_space_mb() < MIN_FREE_SPACE_MB
+    def is_low(self) -> bool:
+        return self.get_free_mb() < 500
     
-    def rotate_logs(self, emergency: bool = False) -> dict:
-        """Rotate logs to free space."""
-        import gzip
-        stats = {"truncated": 0, "deleted": 0, "compressed": 0}
+    def cleanup(self, emergency: bool = False):
+        """Clean up old files."""
+        stats = {"deleted": 0, "truncated": 0}
         
-        # 1. Truncate daemon log
-        max_size = 500_000 if emergency else 1_000_000
+        # Truncate log
+        max_size = 300_000 if emergency else 500_000
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > max_size:
             try:
                 content = LOG_FILE.read_text()
-                LOG_FILE.write_text(f"...(rotated {datetime.now().isoformat()})...\n" + content[-max_size:])
-                os.chmod(LOG_FILE, 0o666)
+                LOG_FILE.write_text(f"...(rotated)...\n{content[-max_size:]}")
                 stats["truncated"] += 1
             except Exception:
                 pass
         
-        # 2. Delete old condense backups
-        keep_count = 3 if emergency else 5
-        backup_dir = RALPH_DIR / "condense_backups"
-        if backup_dir.exists():
-            backups = sorted(backup_dir.glob("condensed_*.md"))
-            for old in backups[:-keep_count]:
-                try:
-                    old.unlink()
-                    stats["deleted"] += 1
-                except Exception:
-                    pass
-        
-        # 3. Compress old iteration logs (>7 days for normal, >3 days for emergency)
+        # Delete old iteration logs
+        keep = 100 if emergency else MAX_ITERATION_LOGS
         if ITERATIONS_DIR.exists():
-            days = 3 if emergency else 7
-            cutoff = time.time() - (days * 24 * 3600)
-            for log_file in ITERATIONS_DIR.glob("*.log"):
+            for old in sorted(ITERATIONS_DIR.glob("*.log"))[:-keep]:
                 try:
-                    if log_file.stat().st_mtime < cutoff:
-                        gz_path = log_file.with_suffix(".log.gz")
-                        with open(log_file, 'rb') as f_in:
-                            with gzip.open(gz_path, 'wb') as f_out:
-                                f_out.writelines(f_in)
-                        log_file.unlink()
-                        stats["compressed"] += 1
+                    old.unlink()
+                    stats["deleted"] += 1
                 except Exception:
                     pass
-        
-        # 4. Limit iteration JSON files
-        keep_json = 100 if emergency else 500
-        if ITERATIONS_DIR.exists():
-            json_files = sorted(ITERATIONS_DIR.glob("*.json"))
-            for old in json_files[:-keep_json]:
+            for old in sorted(ITERATIONS_DIR.glob("*.json"))[:-keep]:
                 try:
                     old.unlink()
                     stats["deleted"] += 1
                 except Exception:
                     pass
         
-        # 5. Trim semantic cache (keep recent entries only)
-        cache_file = RALPH_DIR / "semantic_cache.json"
-        if cache_file.exists():
-            try:
-                cache = json.loads(cache_file.read_text())
-                keep_cache = 3000 if emergency else 8000
-                if len(cache) > keep_cache:
-                    keys = list(cache.keys())[-keep_cache:]
-                    cache = {k: cache[k] for k in keys}
-                    cache_file.write_text(json.dumps(cache))
-                    os.chmod(cache_file, 0o666)
-                    stats["truncated"] += 1
-            except Exception:
-                pass
+        if stats["deleted"] or stats["truncated"]:
+            log(f"Cleanup: deleted={stats['deleted']}, truncated={stats['truncated']}")
+
+
+# =============================================================================
+# CIRCUIT BREAKER
+# =============================================================================
+
+class CircuitBreaker:
+    """Circuit breaker for external services."""
+    
+    def __init__(self, name: str, threshold: int = 5, timeout: float = 120.0):
+        self.name = name
+        self.threshold = threshold
+        self.timeout = timeout
+        self.failures = 0
+        self.state = "CLOSED"
+        self.last_failure = 0.0
+    
+    def can_proceed(self) -> bool:
+        if self.state == "CLOSED":
+            return True
+        if self.state == "OPEN":
+            if time.time() - self.last_failure >= self.timeout:
+                self.state = "HALF_OPEN"
+                return True
+            return False
+        return True
+    
+    def record_success(self):
+        if self.state == "HALF_OPEN":
+            self.state = "CLOSED"
+            log(f"Circuit {self.name}: recovered")
+        self.failures = 0
+    
+    def record_failure(self):
+        self.failures += 1
+        self.last_failure = time.time()
+        if self.failures >= self.threshold:
+            self.state = "OPEN"
+            log(f"Circuit {self.name}: OPEN")
+
+
+# =============================================================================
+# EPOCH MANAGER
+# =============================================================================
+
+class EpochManager:
+    """Manage milestone snapshots."""
+    
+    def __init__(self):
+        self.epochs_dir = RALPH_DIR / "epochs"
+        self.epochs_dir.mkdir(exist_ok=True)
+    
+    def check_milestone(self, iteration: int) -> Optional[str]:
+        config = read_config()
+        last_epoch = config.get("lastEpochIteration", 0)
         
-        # 6. Delete old compressed logs in emergency
-        if emergency and ITERATIONS_DIR.exists():
-            gz_files = sorted(ITERATIONS_DIR.glob("*.log.gz"))
-            for old in gz_files[:-50]:
-                try:
-                    old.unlink()
-                    stats["deleted"] += 1
-                except Exception:
-                    pass
+        if iteration - last_epoch < 25:
+            return None
         
-        if stats["truncated"] or stats["deleted"] or stats["compressed"]:
-            log(f"Disk cleanup: truncated={stats['truncated']}, deleted={stats['deleted']}, compressed={stats['compressed']}")
+        prd = read_prd()
+        stories = prd.get("userStories", [])
+        done = sum(1 for s in stories if s.get("passes"))
+        total = len(stories) or 1
         
-        return stats
+        if iteration % 100 == 0:
+            return f"iteration_{iteration}"
+        
+        pct = done / total
+        if pct >= 0.5 and not config.get("50pctSaved"):
+            return "50pct_complete"
+        if pct >= 0.75 and not config.get("75pctSaved"):
+            return "75pct_complete"
+        
+        return None
+    
+    def save_epoch(self, iteration: int, reason: str):
+        config = read_config()
+        epoch_num = config.get("currentEpoch", 0) + 1
+        
+        prd = read_prd()
+        stories = prd.get("userStories", [])
+        done = sum(1 for s in stories if s.get("passes"))
+        
+        epoch_data = {
+            "epoch": epoch_num,
+            "iteration": iteration,
+            "reason": reason,
+            "timestamp": datetime.now().isoformat(),
+            "progress": {"done": done, "total": len(stories)}
+        }
+        
+        epoch_file = self.epochs_dir / f"epoch_{epoch_num:03d}.json"
+        atomic_write_json(epoch_file, epoch_data)
+        
+        update_config("currentEpoch", epoch_num)
+        update_config("lastEpochIteration", iteration)
+        
+        if "50pct" in reason:
+            update_config("50pctSaved", True)
+        if "75pct" in reason:
+            update_config("75pctSaved", True)
+        
+        log(f"Saved epoch {epoch_num}: {reason}")
 
 
 # =============================================================================
 # GLOBAL INSTANCES
 # =============================================================================
 
-semantic_search = None
-memory = None
-learnings_mgr = None
-condenser = None
-metrics = None
-epochs = None
-stuck_detector = None
-circuit_breaker = None
-disk_monitor = None
+semantic_search: SemanticSearch = None
+memory: HierarchicalMemory = None
+learnings_mgr: LearningsManager = None
+condenser: ContextCondenser = None
+divergence_detector: DivergenceDetector = None
+knowledge_decay: KnowledgeDecay = None
+self_reflection: SelfReflection = None
+adaptive_context: AdaptiveContext = None
+metrics: RalphMetrics = None
+epochs: EpochManager = None
+stuck_detector: StuckDetector = None
+circuit_breaker: CircuitBreaker = None
+disk_monitor: DiskSpaceMonitor = None
 
 
 def init_managers():
-    """Initialize global managers."""
-    global semantic_search, memory, learnings_mgr, condenser, metrics, epochs
-    global stuck_detector, circuit_breaker, disk_monitor
+    """Initialize all managers."""
+    global semantic_search, memory, learnings_mgr, condenser
+    global divergence_detector, knowledge_decay, self_reflection, adaptive_context
+    global metrics, epochs, stuck_detector, circuit_breaker, disk_monitor
     
     semantic_search = SemanticSearch()
-    memory = HierarchicalMemory()
+    memory = HierarchicalMemory(semantic_search)
     learnings_mgr = LearningsManager(semantic_search)
     condenser = ContextCondenser(semantic_search)
+    divergence_detector = DivergenceDetector(semantic_search)
+    knowledge_decay = KnowledgeDecay(semantic_search)
+    self_reflection = SelfReflection(semantic_search)
+    adaptive_context = AdaptiveContext(semantic_search)
     metrics = RalphMetrics()
     epochs = EpochManager()
     stuck_detector = StuckDetector()
-    circuit_breaker = CircuitBreaker("openhands", failure_threshold=5, recovery_timeout=120)
+    circuit_breaker = CircuitBreaker("openhands", threshold=5, timeout=120)
     disk_monitor = DiskSpaceMonitor()
     
-    log("All managers initialized")
+    log("All managers initialized (v2.0 - Enhanced)")
 
 
 # =============================================================================
-# BASIC FUNCTIONS
+# CORE FUNCTIONS
 # =============================================================================
 
 def get_current_task(prd: dict) -> Optional[dict]:
-    """Get next pending task from PRD (skip blocked tasks)."""
-    stories = prd.get("userStories", [])
-    for story in stories:
+    """Get next pending task."""
+    for story in prd.get("userStories", []):
         if not story.get("passes", False) and not story.get("blocked", False):
             return story
     return None
 
 
 def mark_task_done(task_id: str, passed: bool = True):
-    """Mark task as done in PRD."""
     prd = read_prd()
     for story in prd.get("userStories", []):
         if story.get("id") == task_id:
@@ -1347,101 +1686,11 @@ def mark_task_done(task_id: str, passed: bool = True):
             story["completedAt"] = datetime.now().isoformat()
             break
     save_prd(prd)
-    log(f"Task {task_id} marked as {'PASS' if passed else 'FAIL'}")
-
-
-def set_pending_verification(task_id: str, iteration: int, task_title: str = "", task_desc: str = ""):
-    """Set task for verification with full context."""
-    config = read_config()
-    config["pendingTaskVerification"] = {
-        "taskId": task_id,
-        "taskTitle": task_title,
-        "taskDescription": task_desc,
-        "claimedAt": datetime.now().isoformat(),
-        "claimedIteration": iteration
-    }
-    save_config(config)
-
-
-def clear_pending_verification():
-    """Clear pending verification."""
-    config = read_config()
-    config["pendingTaskVerification"] = None
-    save_config(config)
-
-
-def should_run_condense(config: dict, iteration: int) -> Tuple[bool, str]:
-    """Check if context condensation should run using condenser."""
-    if condenser is None:
-        return False, "condenser not initialized"
-    
-    # Calculate context size
-    context_size = 0
-    if LEARNINGS_FILE.exists():
-        context_size += len(LEARNINGS_FILE.read_text())
-    if CONDENSED_FILE.exists():
-        context_size += len(CONDENSED_FILE.read_text())
-    
-    # Check if next is architect
-    architect_interval = config.get("architectInterval", 10)
-    next_is_architect = (architect_interval > 0 and 
-                         (iteration + 1) % architect_interval == 0)
-    
-    return condenser.should_condense(iteration, config, context_size, next_is_architect)
-
-
-def get_iteration_type(config: dict) -> str:
-    """Determine iteration type based on state."""
-    prd = read_prd()
-    iteration = config.get("currentIteration", 0)
-    
-    # Check for pending verification first
-    pending = config.get("pendingTaskVerification")
-    if pending and pending.get("taskId"):
-        return "task_verify"
-    
-    phase = prd.get("phase", "planning")
-    
-    # Planning phase
-    if phase == "planning":
-        # Check if PLAN task is done
-        for story in prd.get("userStories", []):
-            if story.get("id") == "PLAN" and story.get("passes"):
-                # Planning done, move to execution
-                prd["phase"] = "execution"
-                save_prd(prd)
-                return "worker"
-        return "planning"
-    
-    # Verification phase (final project verification)
-    if phase == "verification":
-        return "verification"
-    
-    # Execution phase - check for condense/architect
-    
-    # Check for condense
-    should_condense, reason = should_run_condense(config, iteration)
-    if should_condense:
-        log(f"Condense needed: {reason}")
-        return "condense"
-    
-    # Check for architect interval
-    architect_interval = config.get("architectInterval", 10)
-    if architect_interval > 0 and iteration > 0 and iteration % architect_interval == 0:
-        return "architect"
-    
-    # Check if all tasks done -> verification phase
-    current_task = get_current_task(prd)
-    if not current_task:
-        prd["phase"] = "verification"
-        save_prd(prd)
-        return "verification"
-    
-    return "worker"
+    log(f"Task {task_id}: {'PASS' if passed else 'FAIL'}")
 
 
 def parse_ralph_tags(output: str) -> dict:
-    """Parse ralph tags from iteration output."""
+    """Parse ralph tags from output."""
     result = {
         "task_done": None,
         "task_verified": None,
@@ -1450,12 +1699,10 @@ def parse_ralph_tags(output: str) -> dict:
         "learnings": []
     }
     
-    # TASK_DONE:TASK-XXX
     match = re.search(r'<ralph>TASK_DONE:([^<]+)</ralph>', output)
     if match:
         result["task_done"] = match.group(1).strip()
     
-    # TASK_VERIFIED:TASK-XXX:PASS or TASK_VERIFIED:TASK-XXX:FAIL:reason
     match = re.search(r'<ralph>TASK_VERIFIED:([^:]+):(\w+)(?::([^<]+))?</ralph>', output)
     if match:
         result["task_verified"] = {
@@ -1464,380 +1711,237 @@ def parse_ralph_tags(output: str) -> dict:
             "reason": match.group(3).strip() if match.group(3) else None
         }
     
-    # STUCK
     if '<ralph>STUCK</ralph>' in output:
         result["stuck"] = True
     
-    # PROJECT_VERIFIED
     if '<ralph>PROJECT_VERIFIED</ralph>' in output:
         result["project_verified"] = True
     
-    # LEARNING:text
     for match in re.finditer(r'<ralph>LEARNING:([^<]+)</ralph>', output):
         result["learnings"].append(match.group(1).strip())
     
     return result
 
 
-def append_learnings(learnings: List[str], iteration: int):
-    """Append learnings with deduplication via semantic search."""
-    if not learnings or not learnings_mgr:
-        return
-    
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    added_count = 0
-    
-    for learning in learnings:
-        learning = learning.strip()
-        if not learning:
-            continue
-        
-        # Format learning with context
-        formatted = f"## Iteration {iteration} ({timestamp})\n- {learning}"
-        
-        if learnings_mgr.add(formatted):
-            added_count += 1
-            # Also add key point to permanent memory
-            if memory:
-                memory.add_permanent(learning)
-            if metrics:
-                metrics.record_learning(added=True)
-        else:
-            if metrics:
-                metrics.record_learning(added=False, duplicate=True)
-    
-    if added_count > 0:
-        log(f"Added {added_count}/{len(learnings)} new learnings")
-
-
 def read_file_limited(filepath: Path, max_chars: int = 50000) -> str:
-    """Read file with character limit."""
+    """Read file with limit."""
     if not filepath.exists():
         return ""
     try:
         content = filepath.read_text()
         if len(content) > max_chars:
-            return f"...(truncated, showing last {max_chars} chars)...\n" + content[-max_chars:]
+            return f"...(truncated)...\n{content[-max_chars:]}"
         return content
     except Exception:
         return ""
 
 
-def get_last_iteration_summary() -> str:
-    """Get summary of last iteration for context."""
-    try:
-        # Find latest iteration log
-        logs = sorted(ITERATIONS_DIR.glob("iteration_*.log"), reverse=True)
-        if not logs:
-            return "(First iteration)"
-        
-        last_log = logs[0]
-        content = last_log.read_text()
-        
-        # Get last 2000 chars
-        if len(content) > 2000:
-            content = "...\n" + content[-2000:]
-        
-        return content
-    except Exception:
-        return "(Could not read last iteration)"
-
-
-def get_completed_tasks_summary(prd: dict) -> str:
-    """Get summary of completed tasks."""
-    stories = prd.get("userStories", [])
-    completed = [s for s in stories if s.get("passes")]
-    
-    if not completed:
-        return "(No tasks completed yet)"
-    
-    lines = []
-    for s in completed[-10:]:  # Last 10 completed
-        lines.append(f"  [DONE] [{s.get('id', '?')}] {s.get('title', '?')}")
-    
-    if len(completed) > 10:
-        lines.insert(0, f"  ... and {len(completed) - 10} more completed tasks")
-    
-    return "\n".join(lines)
-
-
-def get_project_summary() -> str:
-    """Get current project state summary."""
+def get_iteration_type(config: dict) -> str:
+    """Determine iteration type."""
     prd = read_prd()
-    stories = prd.get("userStories", [])
-    done = sum(1 for s in stories if s.get("passes"))
-    total = len(stories)
-    phase = prd.get("phase", "unknown")
-    
-    return f"Phase: {phase}, Progress: {done}/{total} tasks complete"
-
-
-def substitute_prompt_vars(template: str, config: dict, iter_type: str) -> str:
-    """Substitute variables in prompt template with smart context selection."""
-    prd = read_prd()
-    task = get_current_task(prd)
-    stories = prd.get("userStories", [])
-    done = sum(1 for s in stories if s.get("passes"))
-    total = len(stories)
     iteration = config.get("currentIteration", 0)
     
-    # For verification - use pending task info
-    pending = config.get("pendingTaskVerification", {}) or {}
+    # Pending verification
+    pending = config.get("pendingTaskVerification")
+    if pending and pending.get("taskId"):
+        return "task_verify"
     
-    # Task info - use pending info for task_verify, current task otherwise
-    if iter_type == "task_verify" and pending:
-        task_id = pending.get("taskId", "UNKNOWN")
-        task_title = pending.get("taskTitle", "")
-        task_desc = pending.get("taskDescription", "")
-        verify_task_id = task_id
-    else:
-        task_id = task.get("id", "UNKNOWN") if task else "NONE"
-        task_title = task.get("title", "") if task else ""
-        task_desc = task.get("description", "") if task else ""
-        verify_task_id = task_id
+    phase = prd.get("phase", "planning")
     
-    # Read base context files
+    if phase == "planning":
+        for story in prd.get("userStories", []):
+            if story.get("id") == "PLAN" and story.get("passes"):
+                prd["phase"] = "execution"
+                save_prd(prd)
+                return "worker"
+        return "planning"
+    
+    if phase == "verification":
+        return "verification"
+    
+    # Check for self-reflection
+    if self_reflection and self_reflection.should_reflect(iteration):
+        return "reflection"
+    
+    # Check for condense
+    should_cond, reason = condenser.should_condense(iteration, config) if condenser else (False, "")
+    if should_cond:
+        return "condense"
+    
+    # Architect interval
+    arch_interval = config.get("architectInterval", 10)
+    if arch_interval > 0 and iteration > 0 and iteration % arch_interval == 0:
+        return "architect"
+    
+    # All done?
+    if not get_current_task(prd):
+        prd["phase"] = "verification"
+        save_prd(prd)
+        return "verification"
+    
+    return "worker"
+
+
+def build_prompt(config: dict, iter_type: str) -> str:
+    """Build prompt with adaptive context."""
+    prd = read_prd()
+    task = get_current_task(prd)
+    iteration = config.get("currentIteration", 0)
+    
+    task_id = task.get("id", "NONE") if task else "NONE"
+    task_title = task.get("title", "") if task else ""
+    task_desc = task.get("description", "") if task else ""
+    current_task_context = f"{task_title} {task_desc}"
+    
+    # Load raw content
     mission = read_file_limited(MISSION_FILE, MISSION_LIMIT)
     architecture = read_file_limited(ARCHITECTURE_FILE, ARCHITECTURE_LIMIT)
+    guardrails = read_file_limited(RALPH_DIR / "guardrails.md", GUARDRAILS_LIMIT)
     
-    # Smart learnings selection using managers
-    if condenser and condenser.get_condensed():
-        # Use condensed + recent learnings
-        learnings = condenser.get_condensed()
-        if learnings_mgr and task:
-            # Add task-relevant recent learnings
-            query = f"{task_title} {task_desc}"
-            recent = learnings_mgr.get_relevant(query, max_chars=5000)
-            if recent:
-                learnings += "\n\n## Recent Relevant Learnings\n" + recent
-    elif learnings_mgr and task:
-        # Use semantic search for relevant learnings
-        query = f"{task_title} {task_desc}"
-        learnings = learnings_mgr.get_relevant(query, max_chars=LEARNINGS_LIMIT)
-    else:
-        learnings = read_file_limited(LEARNINGS_FILE, LEARNINGS_LIMIT)
+    # Get relevant learnings
+    learnings = ""
+    if learnings_mgr:
+        learnings = learnings_mgr.get_relevant(current_task_context, LEARNINGS_LIMIT)
     
-    # Get hierarchical memory context
+    # Get memory context
     memory_context = ""
-    if memory and task:
-        keywords = [w for w in f"{task_title} {task_desc}".split() if len(w) > 3]
-        memory_context = memory.get_context(keywords, max_chars=MEMORY_CONTEXT_LIMIT)
+    if memory:
+        memory_context = memory.get_context(current_task_context, MEMORY_CONTEXT_LIMIT)
     
-    # Build sections
-    last_iteration = get_last_iteration_summary()
-    completed_tasks = get_completed_tasks_summary(prd)
-    project_summary = get_project_summary()
+    # Get reflection summary
+    reflection_summary = ""
+    if self_reflection:
+        reflection_summary = self_reflection.get_last_reflection_summary()
     
-    # Guardrails
-    guardrails_file = RALPH_DIR / "guardrails.md"
-    guardrails_section = read_file_limited(guardrails_file, 5000)
+    # Use adaptive context to optimize
+    if adaptive_context:
+        optimized = adaptive_context.build_context(
+            current_task=current_task_context,
+            mission=mission,
+            architecture=architecture,
+            learnings=learnings,
+            memory_context=memory_context,
+            reflection_summary=reflection_summary,
+            guardrails=guardrails
+        )
+        mission = optimized.get('mission', mission)
+        architecture = optimized.get('architecture', architecture)
+        learnings = optimized.get('learnings', learnings)
+        memory_context = optimized.get('memory', memory_context)
+        guardrails = optimized.get('guardrails', guardrails)
     
-    # AGENTS.md for build instructions
-    agents_file = RALPH_DIR / "AGENTS.md"
-    agents_section = read_file_limited(agents_file, 5000)
+    # Load template
+    template = load_prompt_template(iter_type)
     
-    # Previous attempts on this task (from stuck detector)
-    previous_attempts = ""
-    if stuck_detector and task_id:
-        previous_attempts = stuck_detector.get_task_attempts(task_id)
+    # Substitutions
+    stories = prd.get("userStories", [])
+    done = sum(1 for s in stories if s.get("passes"))
     
-    fix_history = ""
+    pending = config.get("pendingTaskVerification", {}) or {}
     
-    # Get epoch context for long projects
-    epoch_context = ""
-    if epochs:
-        epoch_context = epochs.get_epoch_context()
-    
-    # Variable substitutions
-    substitutions = {
+    subs = {
         "${iteration}": str(iteration),
         "${task_id}": task_id,
         "${task_title}": task_title,
         "${task_description}": task_desc,
         "${done_tasks}": str(done),
-        "${total_tasks}": str(total),
+        "${total_tasks}": str(len(stories)),
         "${mission}": mission,
         "${learnings}": learnings,
         "${architecture}": architecture,
-        "${last_iteration}": last_iteration,
-        "${completed_tasks}": completed_tasks,
-        "${project_summary}": project_summary,
-        "${guardrails_section}": guardrails_section,
-        "${agents_section}": agents_section,
-        "${previous_attempts}": previous_attempts,
-        "${fix_history}": fix_history,
-        "${verify_task_id}": verify_task_id,
         "${memory_context}": memory_context,
-        "${epoch_context}": epoch_context,
+        "${guardrails_section}": guardrails,
+        "${reflection_summary}": reflection_summary,
+        "${verify_task_id}": pending.get("taskId", task_id),
+        "${previous_attempts}": stuck_detector.get_task_attempts(task_id) if stuck_detector else "",
     }
     
     result = template
-    for var, value in substitutions.items():
-        result = result.replace(var, value)
+    for var, val in subs.items():
+        result = result.replace(var, val)
     
     return result
 
 
 def load_prompt_template(iter_type: str) -> str:
-    """Load prompt template for iteration type.
-    
-    Priority:
-    1. /workspace/.ralph/prompts/{iter_type}.md (project-specific)
-    2. /workspace/.ralph/prompts/global/{iter_type}.md (global templates synced from host)
-    3. Fallback built-in prompts
-    
-    Prompts are read fresh each iteration - edit on host, applies next iteration.
-    """
-    # Project-specific prompts
+    """Load prompt template."""
+    # Project-specific
     project_prompt = RALPH_DIR / "prompts" / f"{iter_type}.md"
     if project_prompt.exists():
         return project_prompt.read_text()
     
-    # Global templates (synced from host templates/ralph/)
+    # Global
     global_prompt = RALPH_DIR / "prompts" / "global" / f"{iter_type}.md"
     if global_prompt.exists():
         return global_prompt.read_text()
     
-    # Minimal fallback prompts
-    fallback_prompts = {
-        "planning": """# Ralph Planning - Iteration ${iteration}
-
-Read .ralph/MISSION.md and create execution plan.
-Break down into small tasks in .ralph/prd.json.
-
-When done: <ralph>TASK_DONE:PLAN</ralph>""",
-        
-        "worker": """# Ralph Worker - Iteration ${iteration}
-Task: ${task_id} - ${task_title}
-
-${mission}
-
-Implement this task. Commit your changes.
-When done: <ralph>TASK_DONE:${task_id}</ralph>
-
-If stuck: <ralph>STUCK</ralph>""",
-        
-        "task_verify": """# Ralph Independent Verification - Iteration ${iteration}
-
-## Task Being Verified
-ID: ${verify_task_id}
-Title: ${task_title}
-Description: ${task_description}
-
-## Instructions
-Worker claimed this task is done. You must INDEPENDENTLY verify:
-1. Check actual code changes match the task requirements
-2. Run relevant tests
-3. Verify the implementation is correct and complete
-
-## Output
-If PASS (task is truly complete): <ralph>TASK_VERIFIED:${verify_task_id}:PASS</ralph>
-If FAIL (not done or buggy): <ralph>TASK_VERIFIED:${verify_task_id}:FAIL:specific reason</ralph>""",
-        
-        "architect": """# Ralph Architect Review - Iteration ${iteration}
-
-Review architecture and progress. Update ARCHITECTURE.md.
-Progress: ${done_tasks}/${total_tasks}
-
-${architecture}""",
-        
-        "verification": """# Project Verification - Iteration ${iteration}
-
-Verify entire project is complete. Run full tests.
-
-If complete: <ralph>PROJECT_VERIFIED</ralph>
-If not: <ralph>PROJECT_NOT_VERIFIED:reason</ralph>""",
-        
-        "condense": """# Context Condensation - Iteration ${iteration}
-
-Summarize progress and learnings. Update LEARNINGS.md with key facts only.
-Remove redundant information, keep essential knowledge."""
+    # Fallbacks
+    fallbacks = {
+        "planning": "# Planning - Iter ${iteration}\nCreate execution plan. <ralph>TASK_DONE:PLAN</ralph> when done.",
+        "worker": "# Worker - Iter ${iteration}\nTask: ${task_id} - ${task_title}\n${task_description}\n\nWhen done: <ralph>TASK_DONE:${task_id}</ralph>",
+        "task_verify": "# Verify - Iter ${iteration}\nVerify ${verify_task_id}.\n<ralph>TASK_VERIFIED:${verify_task_id}:PASS</ralph> or FAIL:reason",
+        "architect": "# Architect - Iter ${iteration}\nReview architecture. Progress: ${done_tasks}/${total_tasks}",
+        "verification": "# Project Verification\n<ralph>PROJECT_VERIFIED</ralph> when complete.",
+        "condense": "# Condense Context\nSummarize key learnings. Remove noise.",
+        "reflection": self_reflection.get_reflection_prompt(memory, divergence_detector, learnings_mgr.count(), 0) if self_reflection else "# Reflect on progress"
     }
     
-    return fallback_prompts.get(iter_type, f"Continue working. Iteration type: {iter_type}")
-
-
-def build_prompt(config: dict, iter_type: str) -> str:
-    """Build full prompt for iteration with variable substitution."""
-    template = load_prompt_template(iter_type)
-    return substitute_prompt_vars(template, config, iter_type)
+    return fallbacks.get(iter_type, f"Continue. Type: {iter_type}")
 
 
 def handle_iteration_result(iteration: int, iter_type: str, output: str, config: dict) -> str:
-    """Handle iteration result and update state. Returns result status."""
+    """Handle iteration result."""
     tags = parse_ralph_tags(output)
     result = "unknown"
     
     # Save learnings
-    if tags["learnings"]:
-        append_learnings(tags["learnings"], iteration)
+    if tags["learnings"] and learnings_mgr:
+        for learning in tags["learnings"]:
+            learnings_mgr.add(learning, iteration)
     
-    # Handle based on iteration type
+    # Record in divergence detector
+    if divergence_detector:
+        summary = output[:500] if len(output) > 500 else output
+        divergence_detector.record_iteration(iteration, summary, result)
+    
+    # Handle by type
     if iter_type == "task_verify":
         if tags["task_verified"]:
             tv = tags["task_verified"]
             if tv["passed"]:
-                # Verification passed - mark task done
                 mark_task_done(tv["task_id"], True)
-                clear_pending_verification()
+                config.pop("pendingTaskVerification", None)
+                save_config(config)
                 result = "verified_pass"
-                log(f"Task {tv['task_id']} verified PASS")
             else:
-                # Verification failed - task needs more work
-                clear_pending_verification()
+                config.pop("pendingTaskVerification", None)
+                save_config(config)
                 result = "verified_fail"
-                log(f"Task {tv['task_id']} verified FAIL: {tv.get('reason', 'unknown')}")
         else:
-            # No verification tag - count retry attempts
-            pending = config.get("pendingTaskVerification", {}) or {}
-            task_id = pending.get("taskId")
-            retry_count = pending.get("retryCount", 0) + 1
-            
-            if retry_count >= MAX_VERIFY_RETRIES:
-                # After max retries, assume fail and let worker retry
-                log_warning(f"Task {task_id} - {MAX_VERIFY_RETRIES} verification attempts without tag, treating as FAIL")
-                clear_pending_verification()
-                result = "verified_fail"
-            else:
-                # Keep pending, increment retry counter - will verify again
-                config = read_config()
-                if config.get("pendingTaskVerification"):
-                    config["pendingTaskVerification"]["retryCount"] = retry_count
-                    save_config(config)
-                result = "verify_retry"
-                log_warning(f"Task {task_id} - no verify tag, retry {retry_count}/{MAX_VERIFY_RETRIES}")
+            result = "verify_retry"
     
     elif iter_type == "worker":
         if tags["task_done"]:
             task_id = tags["task_done"]
-            # Get task info for verification context
-            prd = read_prd()
-            task_info = None
-            for s in prd.get("userStories", []):
-                if s.get("id") == task_id:
-                    task_info = s
-                    break
-            
-            # Set for verification if enabled
-            require_verify = config.get("requireVerification", True)
-            if require_verify:
-                set_pending_verification(
-                    task_id, iteration,
-                    task_title=task_info.get("title", "") if task_info else "",
-                    task_desc=task_info.get("description", "") if task_info else ""
-                )
+            if config.get("requireVerification", True):
+                prd = read_prd()
+                task = None
+                for s in prd.get("userStories", []):
+                    if s.get("id") == task_id:
+                        task = s
+                        break
+                config["pendingTaskVerification"] = {
+                    "taskId": task_id,
+                    "taskTitle": task.get("title", "") if task else "",
+                    "taskDescription": task.get("description", "") if task else ""
+                }
+                save_config(config)
                 result = "pending_verify"
-                log(f"Task {task_id} claimed done, pending verification")
             else:
                 mark_task_done(task_id, True)
                 result = "task_done"
-                log(f"Task {task_id} done (no verification)")
         elif tags["stuck"]:
             result = "stuck"
-            log_warning("Worker reported STUCK")
-            # Increment stuck counter
-            stuck_count = config.get("stuckCount", 0) + 1
-            update_config("stuckCount", stuck_count)
         else:
             result = "working"
     
@@ -1845,7 +1949,6 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
         if tags["task_done"] and "PLAN" in tags["task_done"].upper():
             mark_task_done("PLAN", True)
             result = "planning_done"
-            log("Planning phase complete")
         else:
             result = "planning"
     
@@ -1853,11 +1956,9 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
         if tags["project_verified"]:
             prd = read_prd()
             prd["verified"] = True
-            prd["verifiedAt"] = datetime.now().isoformat()
             save_prd(prd)
             update_config("status", "complete")
             result = "project_verified"
-            log("PROJECT VERIFIED - All done!")
         else:
             result = "verification_pending"
     
@@ -1865,77 +1966,87 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
         result = "architect_done"
     
     elif iter_type == "condense":
-        # Use condenser to parse and save with verification
         if condenser:
-            condensed_text = condenser.parse_condensed(output)
-            if condensed_text:
-                # Get original content for verification
-                original = ""
-                if LEARNINGS_FILE.exists():
-                    original = LEARNINGS_FILE.read_text()
-                original += "\n" + condenser.get_recent_iterations_summary()
-                
-                condenser.save_condensed(iteration, condensed_text, original)
+            condensed = condenser.parse_condensed(output)
+            if condensed:
+                original = learnings_mgr.get_all() if learnings_mgr else ""
+                condenser.save_condensed(iteration, condensed, original)
                 result = "condense_done"
             else:
                 result = "condense_failed"
-                log_warning("Failed to parse condensed output")
         else:
-            # Fallback to simple save
-            match = re.search(r'```condensed\s*\n(.*?)\n```', output, re.DOTALL)
-            if match:
-                condensed = match.group(1).strip()
-                try:
-                    header = f"# Condensed Context (Iteration {iteration})\n"
-                    header += f"# Generated: {datetime.now().isoformat()}\n\n"
-                    CONDENSED_FILE.write_text(header + condensed)
-                    os.chmod(CONDENSED_FILE, 0o666)
-                    log(f"Saved condensed context: {len(condensed)} chars")
-                except Exception as e:
-                    log_error(f"Failed to save condensed: {e}")
             result = "condense_done"
+    
+    elif iter_type == "reflection":
+        if self_reflection:
+            reflection = self_reflection.parse_reflection(output)
+            self_reflection.save_reflection(iteration, reflection)
+            
+            # Act on reflection
+            if reflection['progress'] == 'diverging' and divergence_detector:
+                divergence_detector.clear()
+            
+            if metrics:
+                metrics.record_reflection()
+            
+            result = "reflection_done"
+        else:
+            result = "reflection_done"
+    
+    # Update divergence detector with final result
+    if divergence_detector:
+        divergence_detector.recent_outputs[-1]['outcome'] = result
     
     return result
 
 
 def run_iteration(config: dict) -> Tuple[bool, str]:
-    """Run single iteration. Returns (success, result_type)."""
+    """Run single iteration."""
     global current_process
     
     iteration = config.get("currentIteration", 0) + 1
     update_config("currentIteration", iteration)
     
-    # Check circuit breaker
     if circuit_breaker and not circuit_breaker.can_proceed():
-        log_warning("Circuit breaker OPEN - waiting for recovery")
+        log_warning("Circuit breaker OPEN")
         time.sleep(30)
         return False, "circuit_open"
     
     iter_type = get_iteration_type(config)
     log(f"=== Iteration {iteration} ({iter_type}) ===")
-    add_progress(iteration, f"Starting {iter_type} iteration")
     
-    # Check if stuck on current task
+    # Check divergence
+    if divergence_detector and iter_type == "worker":
+        is_div, reason, action = divergence_detector.check_divergence()
+        if is_div:
+            log_warning(f"DIVERGENCE: {reason}")
+            if metrics:
+                metrics.record_divergence()
+            
+            if action == "escalate_to_architect":
+                iter_type = "architect"
+            elif action == "force_new_approach":
+                # Add to learnings
+                if learnings_mgr:
+                    learnings_mgr.add(f"DIVERGENCE DETECTED: {reason}. Need fresh approach.", iteration)
+    
+    # Check stuck
     prd = read_prd()
     current_task = get_current_task(prd)
     if stuck_detector and current_task and iter_type == "worker":
         task_id = current_task.get("id", "")
         is_stuck, reason = stuck_detector.check_stuck(task_id, iteration)
         if is_stuck:
-            log_warning(f"STUCK detected: {reason}")
+            log_warning(f"STUCK: {reason}")
             strategy = stuck_detector.get_recovery_strategy(reason)
-            
             if strategy == "skip_task":
-                # Mark task as blocked and move on
                 current_task["blocked"] = True
                 current_task["blockedReason"] = reason
                 save_prd(prd)
                 stuck_detector.clear_history()
                 return True, "task_skipped"
             elif strategy == "escalate":
-                # Force architect review
                 iter_type = "architect"
-                log("Escalating to architect review")
     
     # Build prompt
     prompt = build_prompt(config, iter_type)
@@ -1944,12 +2055,9 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
     ITERATIONS_DIR.mkdir(parents=True, exist_ok=True)
     output_file = ITERATIONS_DIR / f"iteration_{iteration:04d}.log"
     
-    # Build command
-    escaped_prompt = shlex.quote(prompt)
-    cmd = f"openhands --headless --json -t {escaped_prompt}"
+    cmd = f"openhands --headless --json -t {shlex.quote(prompt)}"
     
     start_time = time.time()
-    exit_code = -1
     
     try:
         with open(output_file, "w") as f:
@@ -1960,154 +2068,105 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
                 cwd="/workspace"
             )
             
-            # Wait with timeout
             timeout = config.get("sessionTimeoutSeconds", 1800)
             try:
                 exit_code = current_process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                log_warning(f"Iteration {iteration} timed out after {timeout}s")
+                log_warning(f"Timeout after {timeout}s")
                 current_process.terminate()
-                try:
-                    current_process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    current_process.kill()
-                    current_process.wait()
+                current_process.wait(timeout=10)
                 return False, "timeout"
         
         current_process = None
         elapsed = time.time() - start_time
         
-        # Read and parse output
-        output = ""
-        if output_file.exists():
-            output = output_file.read_text()
-        
-        # Handle result
+        output = output_file.read_text() if output_file.exists() else ""
         result = handle_iteration_result(iteration, iter_type, output, config)
         
-        # Save iteration metadata
-        meta_file = ITERATIONS_DIR / f"iteration_{iteration:04d}.json"
-        meta_file.write_text(json.dumps({
+        # Save metadata
+        meta = {
             "iteration": iteration,
             "type": iter_type,
             "result": result,
-            "exit_code": exit_code,
-            "duration_seconds": int(elapsed),
-            "timestamp": datetime.now().isoformat(),
-            "output_length": len(output)
-        }, indent=2))
-        try:
-            os.chmod(meta_file, 0o666)
-        except Exception:
-            pass
+            "duration": int(elapsed),
+            "timestamp": datetime.now().isoformat()
+        }
+        atomic_write_json(ITERATIONS_DIR / f"iteration_{iteration:04d}.json", meta)
         
-        # Add to hierarchical memory
-        if memory:
-            prd = read_prd()
-            task = get_current_task(prd)
-            task_id = task.get("id", "unknown") if task else iter_type
-            
-            # Extract key points from output
-            key_points = []
+        # Update memory
+        if memory and current_task:
+            task_id = current_task.get("id", iter_type)
             tags = parse_ralph_tags(output)
-            if tags["learnings"]:
-                key_points.extend(tags["learnings"][:5])
-            if tags["task_done"]:
-                key_points.append(f"Completed: {tags['task_done']}")
-            
             memory.add_iteration(
                 iteration=iteration,
                 task_id=task_id,
                 summary=f"{iter_type}: {result}",
-                details=output[-2000:] if len(output) > 2000 else output,
-                key_points=key_points
+                details=output[-2000:],
+                key_points=tags["learnings"][:5],
+                outcome=result
             )
         
-        # Record metrics
+        # Metrics
         if metrics:
-            is_stuck = result == "stuck"
-            metrics.record_iteration(success=True, time_seconds=elapsed, stuck=is_stuck)
+            metrics.record_iteration(True, elapsed, result == "stuck")
             if result == "condense_done":
                 metrics.record_condense()
         
-        # Record in stuck detector
+        # Stuck detector
         if stuck_detector and current_task:
             task_id = current_task.get("id", "")
             completed = result in ["task_done", "pending_verify", "verified_pass"]
-            error_msg = None
-            if result == "stuck":
-                error_msg = "Worker reported STUCK"
-            elif result == "verified_fail":
-                error_msg = "Verification failed"
-            stuck_detector.record_attempt(task_id, iteration, completed, error_msg, iter_type)
+            stuck_detector.record_attempt(task_id, iteration, completed)
         
-        # Record circuit breaker success
+        # Circuit breaker
         if circuit_breaker:
             circuit_breaker.record_success()
         
-        # Check for epoch milestone
+        # Epoch
         if epochs:
             milestone = epochs.check_milestone(iteration)
             if milestone:
                 epochs.save_epoch(iteration, milestone)
         
-        add_progress(iteration, f"Completed: {result} ({int(elapsed)}s)")
-        log(f"Iteration {iteration} complete: {result} ({int(elapsed)}s)")
-        
+        log(f"Iteration {iteration}: {result} ({int(elapsed)}s)")
         return True, result
         
     except Exception as e:
-        log_error(f"Iteration {iteration} failed: {e}")
+        log_error(f"Iteration failed: {e}")
         log_error(traceback.format_exc())
         current_process = None
         
-        # Record failed iteration
         if metrics:
-            metrics.record_iteration(success=False, time_seconds=0)
-        
-        # Record circuit breaker failure
+            metrics.record_iteration(False, 0)
         if circuit_breaker:
-            circuit_breaker.record_failure(str(e))
+            circuit_breaker.record_failure()
         
         return False, "error"
 
 
-def ensure_open_permissions():
-    """Set open permissions on ralph directories so host can access without sudo."""
-    dirs = [RALPH_DIR, ITERATIONS_DIR, MEMORY_DIR, RALPH_DIR / "condense_backups", RALPH_DIR / "epochs"]
-    for d in dirs:
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-            os.chmod(d, 0o777)
-        except Exception:
-            pass
-
-
 def main():
-    """Main daemon loop with retry logic and error recovery."""
+    """Main daemon loop."""
     global shutdown_requested
     
-    # Setup signal handlers
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     
-    # Ensure directories exist with open permissions
-    ensure_open_permissions()
+    # Ensure directories
+    for d in [RALPH_DIR, ITERATIONS_DIR, MEMORY_DIR, REFLECTION_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(d, 0o777)
+        except Exception:
+            pass
     
-    # Write PID file with open permissions
     PID_FILE.write_text(str(os.getpid()))
-    try:
-        os.chmod(PID_FILE, 0o666)
-    except Exception:
-        pass
     
-    log("=" * 50)
-    log("Ralph Daemon Started (Full-featured)")
+    log("=" * 60)
+    log("Ralph Daemon v2.0 Started - Enhanced Autonomy")
     log(f"PID: {os.getpid()}")
-    log(f"Working directory: /workspace")
-    log("=" * 50)
+    log(f"Context budget: {CONTEXT_BUDGET_CHARS} chars (~{CONTEXT_BUDGET_CHARS // 4000}K tokens)")
+    log("=" * 60)
     
-    # Initialize managers
     init_managers()
     
     consecutive_errors = 0
@@ -2120,51 +2179,37 @@ def main():
             config = read_config()
             status = config.get("status", "paused")
             
-            # Auto-promote "starting" to "running" now that daemon is alive
             if status == "starting":
-                log("Daemon alive - promoting status to 'running'")
                 update_config("status", "running")
                 status = "running"
             
             if status == "running":
-                # Check disk space
-                if disk_monitor and disk_monitor.is_low_space():
-                    log_warning("Low disk space - running cleanup")
-                    disk_monitor.rotate_logs(emergency=True)
-                
-                # Periodic maintenance (every 50 iterations)
                 current_iter = config.get("currentIteration", 0)
-                if current_iter > 0 and current_iter % 50 == 0:
-                    # Log rotation
+                
+                # Disk check
+                if disk_monitor and disk_monitor.is_low():
+                    disk_monitor.cleanup(emergency=True)
+                
+                # Periodic maintenance
+                if current_iter > 0 and current_iter % COMPACT_INTERVAL == 0:
                     if disk_monitor:
-                        disk_monitor.rotate_logs(emergency=False)
-                    
-                    # Memory compaction every 100 iterations
-                    if current_iter % 100 == 0 and memory and semantic_search:
-                        memory.compact_cold(semantic_search)
+                        disk_monitor.cleanup()
+                    if memory and semantic_search:
+                        memory.compact(semantic_search)
+                    if semantic_search:
+                        semantic_search.flush_cache()
                 
-                # Check max iterations
+                # Max iterations
                 max_iter = config.get("maxIterations", 0)
-                
                 if max_iter > 0 and current_iter >= max_iter:
                     log(f"Reached max iterations ({max_iter})")
                     update_config("status", "complete")
-                    add_progress(current_iter, "Max iterations reached")
                     continue
                 
-                # Check if project already complete
+                # Already complete?
                 prd = read_prd()
                 if prd.get("verified"):
-                    log("Project already verified complete")
                     update_config("status", "complete")
-                    continue
-                
-                # Check stuck counter
-                stuck_count = config.get("stuckCount", 0)
-                if stuck_count >= 3:
-                    log_warning(f"Stuck {stuck_count} times, requesting human help")
-                    update_config("status", "needs_help")
-                    add_progress(current_iter, "Stuck - needs human intervention")
                     continue
                 
                 # Run iteration
@@ -2173,65 +2218,41 @@ def main():
                 if success:
                     consecutive_errors = 0
                     retry_delay = BASE_DELAY
-                    
-                    # Reset stuck counter on progress
-                    if result not in ["stuck", "working", "unknown"]:
-                        update_config("stuckCount", 0)
                 else:
                     consecutive_errors += 1
-                    log_error(f"Iteration failed (consecutive: {consecutive_errors})")
-                    
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                        log_error(f"Too many errors ({consecutive_errors}), pausing")
                         update_config("status", "error")
-                        add_progress(current_iter, f"Paused due to {consecutive_errors} consecutive errors")
                         consecutive_errors = 0
                     else:
-                        # Exponential backoff
-                        log(f"Retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, 300)  # Max 5 min
+                        retry_delay = min(retry_delay * 2, 300)
                         continue
                 
-                # Pause between iterations
+                # Pause between
                 pause = config.get("pauseBetweenSeconds", 10)
                 if pause > 0:
                     time.sleep(pause)
-                
-            elif status == "paused":
-                # Check periodically for resume
-                time.sleep(5)
-                
-            elif status == "needs_help":
-                # Wait for human intervention
-                time.sleep(30)
-                
-            elif status in ["stopped", "complete"]:
-                # Final states - keep daemon alive but idle
+            
+            elif status in ["paused", "needs_help"]:
+                time.sleep(5 if status == "paused" else 30)
+            
+            elif status in ["stopped", "complete", "error"]:
                 time.sleep(10)
-                
-            elif status == "error":
-                # Error state - wait for manual intervention
-                time.sleep(30)
-                
+            
             else:
-                # Unknown status, treat as paused
-                log_warning(f"Unknown status: {status}, treating as paused")
                 time.sleep(5)
     
     except KeyboardInterrupt:
-        log("Keyboard interrupt received")
+        log("Keyboard interrupt")
     except Exception as e:
-        log_error(f"Fatal daemon error: {e}")
+        log_error(f"Fatal error: {e}")
         log_error(traceback.format_exc())
     finally:
-        # Cleanup
         log("Ralph daemon shutting down")
         try:
             PID_FILE.unlink()
         except Exception:
             pass
-        log("Goodbye!")
 
 
 if __name__ == "__main__":

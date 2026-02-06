@@ -103,27 +103,27 @@ DOCKER_TIMEOUT = 28800  # 8 hours max session timeout
 CONTAINER_PATH = "/root/.local/bin:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
 # =============================================================================
-# CONTEXT LIMITS (optimized for 200K+ token models)
+# CONTEXT LIMITS (optimized for 250K+ token models)
 # =============================================================================
-# Budget allocation for 200K context:
-#   - Ralph prompt content: ~100K tokens (main knowledge)
-#   - OpenHands system/tools: ~30K tokens  
+# Budget allocation for 250K context:
+#   - Ralph prompt content: ~100-150K tokens (main knowledge)
+#   - OpenHands system/tools: ~50K tokens  
 #   - Model working memory: ~50K tokens (for reasoning)
 #   - Safety buffer: ~20K tokens
 # =============================================================================
 
-MAX_PROMPT_TOKENS = 100000  # Our budget, not model's limit
+MAX_PROMPT_TOKENS = 125000  # Our budget for 250K models
 CHARS_PER_TOKEN = 4
 MAX_PROMPT_CHARS = MAX_PROMPT_TOKENS * CHARS_PER_TOKEN
 
-# Knowledge retention limits (chars) - generous for smart context
+# Knowledge retention limits (chars) - optimized for 250K context
 # More context = smarter decisions, but avoid attention dilution
-CRITICAL_LEARNINGS_LIMIT = 40000   # ~10K tokens - errors, patterns
-RECENT_LEARNINGS_LIMIT = 60000     # ~15K tokens - recent discoveries  
-ARCHITECTURE_LIMIT = 50000         # ~12K tokens - project structure
-GUARDRAILS_LIMIT = 25000           # ~6K tokens - mistakes to avoid
-MEMORY_CONTEXT_LIMIT = 40000       # ~10K tokens - iteration history
-MISSION_LIMIT = 40000              # ~10K tokens - full mission context
+CRITICAL_LEARNINGS_LIMIT = 80000   # ~20K tokens - errors, patterns (doubled)
+RECENT_LEARNINGS_LIMIT = 80000     # ~20K tokens - recent discoveries  
+ARCHITECTURE_LIMIT = 60000         # ~15K tokens - project structure
+GUARDRAILS_LIMIT = 30000           # ~7.5K tokens - mistakes to avoid
+MEMORY_CONTEXT_LIMIT = 60000       # ~15K tokens - iteration history
+MISSION_LIMIT = 50000              # ~12.5K tokens - full mission context
 
 # Cleanup thresholds
 MAX_ITERATION_FILES = 1000
