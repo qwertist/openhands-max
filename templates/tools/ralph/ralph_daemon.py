@@ -2062,6 +2062,27 @@ def read_file_limited(filepath: Path, max_chars: int = 50000) -> str:
         return ""
 
 
+def _is_real_task(task_id: str) -> bool:
+    """Check if task ID represents a real task (not planning/architect).
+    
+    MEDIUM FIX: Support both TASK-* (legacy) and bead-style (oh-xxxxx) IDs.
+    """
+    if not task_id:
+        return False
+    # Exclude planning/architect tasks
+    if task_id in ("PLAN", "ARCHITECT", "VERIFY"):
+        return False
+    # Legacy format: TASK-*
+    if task_id.startswith("TASK-"):
+        return True
+    # Bead-style: prefix-xxxxx (e.g., oh-k7m2x)
+    if "-" in task_id and len(task_id.split("-")) == 2:
+        prefix, suffix = task_id.split("-")
+        if len(prefix) >= 2 and len(suffix) == 5 and suffix.isalnum():
+            return True
+    return False
+
+
 def get_iteration_type(config: dict) -> str:
     """Determine iteration type."""
     prd = read_prd()
@@ -2073,9 +2094,19 @@ def get_iteration_type(config: dict) -> str:
         return "task_verify"
     
     phase = prd.get("phase", "planning")
+    stories = prd.get("userStories", [])
+    
+    # Check if real tasks exist (bead-style or TASK-*)
+    real_tasks = [s for s in stories if _is_real_task(s.get("id", ""))]
     
     if phase == "planning":
-        for story in prd.get("userStories", []):
+        if real_tasks:
+            # Real tasks exist - switch to execution
+            prd["phase"] = "execution"
+            save_prd(prd)
+            return "worker"
+        # Also check legacy PLAN task completion
+        for story in stories:
             if story.get("id") == "PLAN" and story.get("passes"):
                 prd["phase"] = "execution"
                 save_prd(prd)

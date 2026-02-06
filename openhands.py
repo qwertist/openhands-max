@@ -7919,8 +7919,25 @@ When something fails, add a SIGN here so future iterations avoid the mistake.
             return "add_planning"
         
         # 3. Initial planning - ONLY if no real tasks exist yet
-        #    (PLAN task doesn't count as real task)
-        real_tasks = [s for s in stories if s.get("id", "").startswith("TASK-")]
+        #    (PLAN, ARCHITECT tasks don't count as real tasks)
+        #    MEDIUM FIX: Support both TASK-* (legacy) and bead-style (oh-xxxxx) IDs
+        def is_real_task(task_id: str) -> bool:
+            if not task_id:
+                return False
+            # Exclude planning/architect tasks
+            if task_id in ("PLAN", "ARCHITECT", "VERIFY"):
+                return False
+            # Legacy format: TASK-*
+            if task_id.startswith("TASK-"):
+                return True
+            # Bead-style: prefix-xxxxx (e.g., oh-k7m2x)
+            if "-" in task_id and len(task_id.split("-")) == 2:
+                prefix, suffix = task_id.split("-")
+                if len(prefix) >= 2 and len(suffix) == 5 and suffix.isalnum():
+                    return True
+            return False
+        
+        real_tasks = [s for s in stories if is_real_task(s.get("id", ""))]
         if not real_tasks:
             # No tasks yet OR phase explicitly set to planning
             return "planning"
