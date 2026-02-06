@@ -122,7 +122,7 @@ SEMANTIC_DIVERGENCE_THRESHOLD = 0.85  # High similarity = potential loop
 SEMANTIC_CONDENSE_VERIFY = 0.50       # Minimum similarity for fact preservation
 
 # Limits - Prevent unbounded growth
-MAX_LEARNINGS_ENTRIES = 400           # Hard limit on learnings
+# No learnings limit - semantic search finds relevant from any size
 MAX_HOT_MEMORY = 8                    # Recent iterations (full detail)
 MAX_WARM_MEMORY = 30                  # Older iterations (summaries)
 MAX_COLD_MEMORY = 150                 # Key points (permanent)
@@ -667,39 +667,11 @@ class LearningsManager:
             'timestamp': datetime.now().isoformat()
         })
         
-        # Check hard limit
-        if len(self._entries) > MAX_LEARNINGS_ENTRIES:
-            self._compact()
+        # No limit - semantic search handles relevance
+        # Duplicate check above prevents bloat
         
         self._save()
         return True
-    
-    def _compact(self):
-        """Compact learnings when over limit."""
-        log(f"Compacting learnings: {len(self._entries)} entries")
-        
-        # Always keep newest 50
-        keep_recent = self._entries[-50:]
-        candidates = self._entries[:-50]
-        
-        if not candidates:
-            return
-        
-        # Score candidates by uniqueness
-        unique = []
-        texts_so_far = [e['content'] for e in keep_recent]
-        
-        for entry in candidates:
-            if not self.semantic.is_duplicate(entry['content'], texts_so_far, threshold=0.70):
-                unique.append(entry)
-                texts_so_far.append(entry['content'])
-        
-        # Keep most unique up to limit
-        max_old = MAX_LEARNINGS_ENTRIES - len(keep_recent)
-        self._entries = unique[-max_old:] + keep_recent
-        
-        log(f"Compacted to {len(self._entries)} entries")
-        self._save()
     
     def get_relevant(self, query: str, max_chars: int = LEARNINGS_LIMIT) -> str:
         """Get relevant learnings for query."""
