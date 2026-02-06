@@ -168,24 +168,38 @@ TASK_CONTEXT_LIMIT = 20000     # ~5K tokens
 # REFLECTION_LIMIT removed
 GUARDRAILS_LIMIT = 10000       # ~2.5K tokens
 
-# Semantic thresholds - Tuned for quality
-SEMANTIC_DUPLICATE_THRESHOLD = 0.72   # Higher = stricter dedup (was 0.55)
+# =============================================================================
+# SYNC-REQUIRED CONSTANTS
+# These constants are duplicated in openhands.py (TUI, runs on host).
+# When changing these, update openhands.py to match!
+# See DUP-001 through DUP-008 in docs/reviews/final-audit-round3.md
+# =============================================================================
+
+# CircuitBreaker defaults (sync with openhands.py CircuitBreaker class)
+CIRCUIT_BREAKER_DEFAULT_THRESHOLD = 5       # Failures before opening circuit
+CIRCUIT_BREAKER_DEFAULT_TIMEOUT = 120.0     # Seconds before retry in OPEN state
+
+# StuckDetector defaults (sync with openhands.py StuckDetector class)
+STUCK_MAX_TASK_ATTEMPTS = 3                 # Max attempts before marking task blocked
+STUCK_MAX_SAME_ERRORS = 4                   # Max same error before stuck
+STUCK_MAX_NO_PROGRESS = 8                   # Max iterations without progress
+
+# Semantic thresholds - Tuned for quality (sync with openhands.py)
+SEMANTIC_DUPLICATE_THRESHOLD = 0.72   # Higher = stricter dedup
 SEMANTIC_COMPACT_THRESHOLD = 0.75     # For cold memory compaction
 SEMANTIC_RELEVANCE_THRESHOLD = 0.20   # For selecting relevant content
 SEMANTIC_DIVERGENCE_THRESHOLD = 0.85  # High similarity = potential loop
 SEMANTIC_CONDENSE_VERIFY = 0.50       # Minimum similarity for fact preservation
 
-# Limits - Prevent unbounded growth
-# No learnings limit - semantic search finds relevant from any size
+# Memory limits (sync with openhands.py)
 MAX_HOT_MEMORY = 8                    # Recent iterations (full detail)
 MAX_WARM_MEMORY = 30                  # Older iterations (summaries)
 MAX_COLD_MEMORY = 150                 # Key points (permanent)
 MAX_ITERATION_LOGS = 200              # Keep last N iteration logs
 MAX_SEMANTIC_CACHE = 8000             # Embedding cache entries
 
-# Maintenance intervals
+# Maintenance intervals (sync with openhands.py)
 COMPACT_INTERVAL = 25                 # Compact every N iterations
-# REFLECTION_INTERVAL removed - using verification instead
 DIVERGENCE_CHECK_WINDOW = 8           # Check last N iterations for loops
 KNOWLEDGE_DECAY_DAYS = 7              # Start decaying after N days
 
@@ -321,6 +335,10 @@ def safe_read_json(filepath: Path, default: Any = None, max_size: int = 50_000_0
     Note: There's a theoretical TOCTOU race (file could grow between stat and read),
     but the practical risk of OOM from unbounded read is far worse than the
     unlikely scenario of a file growing maliciously between two syscalls.
+    
+    SYNC REQUIRED: This function is duplicated in openhands.py.
+    Keep error handling and encoding consistent across both.
+    See: docs/reviews/final-audit-round3.md DUP-004
     """
     if not filepath.exists():
         return default
@@ -702,6 +720,10 @@ class SemanticSearch:
     """Semantic search with LRU cache and batch operations.
     
     FIX: Uses OrderedDict for O(1) LRU operations instead of deque which had O(n) remove().
+    
+    SYNC REQUIRED: This class is duplicated in openhands.py (TUI, runs on host).
+    When modifying this class, update openhands.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-005
     """
     
     _model = None
@@ -836,7 +858,12 @@ class SemanticSearch:
 # =============================================================================
 
 class HierarchicalMemory:
-    """Three-tier memory with relevance-based retrieval."""
+    """Three-tier memory with relevance-based retrieval.
+    
+    SYNC REQUIRED: This class is duplicated in openhands.py (TUI, runs on host).
+    When modifying this class, update openhands.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-006
+    """
     
     def __init__(self, semantic: SemanticSearch):
         MEMORY_DIR.mkdir(exist_ok=True)
@@ -1050,7 +1077,12 @@ class HierarchicalMemory:
 # =============================================================================
 
 class LearningsManager:
-    """Manage learnings with strict limits and semantic deduplication."""
+    """Manage learnings with strict limits and semantic deduplication.
+    
+    SYNC REQUIRED: This class is duplicated in openhands.py (TUI, runs on host).
+    When modifying this class, update openhands.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-007
+    """
     
     def __init__(self, semantic: SemanticSearch):
         self.semantic = semantic
@@ -1195,7 +1227,12 @@ class LearningsManager:
 # =============================================================================
 
 class ContextCondenser:
-    """Condense context with semantic verification."""
+    """Condense context with semantic verification.
+    
+    SYNC REQUIRED: This class is duplicated in openhands.py (TUI, runs on host).
+    When modifying this class, update openhands.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-008
+    """
     
     def __init__(self, semantic: SemanticSearch):
         self.semantic = semantic
@@ -1588,13 +1625,19 @@ class AdaptiveContext:
 # =============================================================================
 
 class StuckDetector:
-    """Enhanced stuck detection with better recovery."""
+    """Enhanced stuck detection with better recovery.
+    
+    SYNC REQUIRED: This class is duplicated in openhands.py (TUI, runs on host).
+    When modifying this class, update openhands.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-002
+    """
     
     def __init__(self):
         self.stuck_file = RALPH_DIR / "stuck_history.json"
-        self.max_task_attempts = 3
-        self.max_same_errors = 4
-        self.max_no_progress = 8
+        # Use named constants (sync with openhands.py)
+        self.max_task_attempts = STUCK_MAX_TASK_ATTEMPTS
+        self.max_same_errors = STUCK_MAX_SAME_ERRORS
+        self.max_no_progress = STUCK_MAX_NO_PROGRESS
     
     def check_stuck(self, current_task_id: str, iteration: int) -> Tuple[bool, str]:
         """Check if stuck."""
@@ -1731,7 +1774,12 @@ class RalphMetrics:
 # =============================================================================
 
 class DiskSpaceMonitor:
-    """Monitor and cleanup disk space."""
+    """Monitor and cleanup disk space.
+    
+    SYNC REQUIRED: This class is duplicated in openhands.py (TUI, runs on host).
+    When modifying this class, update openhands.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-003
+    """
     
     def get_free_mb(self) -> float:
         try:
@@ -1815,9 +1863,15 @@ class CircuitBreaker:
     
     FIX: State is now persisted to survive daemon restarts.
     This prevents crash-loop bypass where failures reset on restart.
+    
+    SYNC REQUIRED: This class is duplicated in openhands.py (TUI, runs on host).
+    When modifying this class, update openhands.py to match!
+    See: docs/reviews/final-audit-round3.md DUP-001
     """
     
-    def __init__(self, name: str, threshold: int = 5, timeout: float = 120.0):
+    def __init__(self, name: str, 
+                 threshold: int = CIRCUIT_BREAKER_DEFAULT_THRESHOLD, 
+                 timeout: float = CIRCUIT_BREAKER_DEFAULT_TIMEOUT):
         self.name = name
         self.threshold = threshold
         self.timeout = timeout
