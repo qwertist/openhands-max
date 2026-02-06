@@ -936,6 +936,11 @@ class ContextCondenser:
     
     def extract_critical_facts(self, content: str) -> List[Dict]:
         """Extract facts that must be preserved."""
+        # FIX: Limit input size to prevent ReDoS (regex denial of service)
+        MAX_CONTENT_SIZE = 100000  # 100KB max
+        if len(content) > MAX_CONTENT_SIZE:
+            content = content[:MAX_CONTENT_SIZE]
+        
         facts = []
         
         # Errors with context
@@ -1070,8 +1075,12 @@ class DivergenceDetector:
         self.history_file = RALPH_DIR / "divergence_history.json"
         self.recent_outputs: deque = deque(maxlen=DIVERGENCE_CHECK_WINDOW)
     
-    def record_iteration(self, iteration: int, output_summary: str, outcome: str) -> dict:
-        """Record iteration for pattern detection. Returns the entry for later updates."""
+    def record_iteration(self, iteration: int, output_summary: str, outcome: str) -> int:
+        """Record iteration for pattern detection. Returns iteration number for later updates.
+        
+        FIX: Return iteration number instead of dict reference to avoid invalidation
+        when deque evicts entries (maxlen exceeded).
+        """
         entry = {
             'iteration': iteration,
             'summary': output_summary[:1000],
@@ -1079,7 +1088,7 @@ class DivergenceDetector:
             'timestamp': datetime.now().isoformat()
         }
         self.recent_outputs.append(entry)
-        return entry
+        return iteration  # Return iteration number, not reference
     
     def check_divergence(self) -> Tuple[bool, str, str]:
         """
@@ -1269,7 +1278,9 @@ class StuckDetector:
             return True, f"Task {current_task_id} failed {len(task_attempts)} times"
         
         # Same error
-        recent_errors = [h.get('error', '') for h in history[-self.max_same_errors:] if h.get('error')]
+        # FIX: Filter out empty strings to prevent false positives
+        recent_errors = [h.get('error', '') for h in history[-self.max_same_errors:] 
+                        if h.get('error') and h.get('error').strip()]
         if len(recent_errors) >= self.max_same_errors:
             unique_errors = set(e[:50] for e in recent_errors)
             if len(unique_errors) == 1:
@@ -1895,11 +1906,11 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
         for learning in tags["learnings"]:
             learnings_mgr.add(learning, iteration)
     
-    # Record in divergence detector - store reference for later update
-    divergence_entry = None
+    # Record in divergence detector - store iteration number for later update
+    divergence_iteration = None
     if divergence_detector:
         summary = output[:500] if len(output) > 500 else output
-        divergence_entry = divergence_detector.record_iteration(iteration, summary, result)
+        divergence_iteration = divergence_detector.record_iteration(iteration, summary, result)
     
     # Handle by type
     if iter_type == "task_verify":
@@ -1978,9 +1989,12 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
             result = "condense_done"
     
     # Update divergence detector with final result
-    # FIX: Use stored reference instead of fragile [-1] access
-    if divergence_entry is not None:
-        divergence_entry['outcome'] = result
+    # FIX: Find entry by iteration number instead of using reference (avoids invalidation bug)
+    if divergence_iteration is not None and divergence_detector:
+        for entry in divergence_detector.recent_outputs:
+            if entry['iteration'] == divergence_iteration:
+                entry['outcome'] = result
+                break
     
     return result
 
@@ -2241,7 +2255,10 @@ def main():
                         semantic_search.flush_cache()
                 
                 # Max iterations
+                # FIX: Validate maxIterations is a valid positive integer
                 max_iter = config.get("maxIterations", 0)
+                if not isinstance(max_iter, int) or max_iter < 0:
+                    max_iter = 0  # Treat invalid as unlimited
                 if max_iter > 0 and current_iter >= max_iter:
                     log(f"Reached max iterations ({max_iter})")
                     update_config("status", "complete")
