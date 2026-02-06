@@ -5484,8 +5484,11 @@ echo "All gateways stopped"
         
         # If new config provided, write it
         if new_config:
-            escaped_config = new_config.replace("'", "'\\''")
-            write_script = f"echo '{escaped_config}' > /root/.openhands/mcp_servers.json"
+            # SECURITY FIX: Use base64 to safely pass config
+            # (single-quote escape didn't protect against newlines)
+            import base64
+            config_b64 = base64.b64encode(new_config.encode('utf-8')).decode('ascii')
+            write_script = f"echo '{config_b64}' | base64 -d > /root/.openhands/mcp_servers.json"
             Docker.exec_in_container(name, write_script, timeout=10)
             print("  New MCP config written")
         
@@ -6225,7 +6228,9 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
         name = project.container_name
         
         if resume_session:
-            oh_cmd = f'openhands --always-approve --resume "{resume_session}"'
+            # SECURITY FIX: Use shlex.quote to prevent shell injection
+            safe_session = shlex.quote(resume_session)
+            oh_cmd = f'openhands --always-approve --resume {safe_session}'
         elif task:
             escaped_task = task.replace('"', '\\"').replace("'", "'\\''")
             oh_cmd = f"openhands --always-approve -t '{escaped_task}'"
@@ -6276,11 +6281,17 @@ fi
             return False
         
         if resume_session:
-            oh_cmd = f'openhands --always-approve --resume "{resume_session}"'
+            # SECURITY FIX: Use shlex.quote to prevent shell injection
+            safe_session = shlex.quote(resume_session)
+            oh_cmd = f'openhands --always-approve --resume {safe_session}'
         elif task:
-            # Write task to file (too large for command line)
+            # SECURITY FIX: Use base64 to safely pass task content
+            # (heredoc was vulnerable to task containing TASKEOF delimiter)
+            import base64
+            task_b64 = base64.b64encode(task.encode('utf-8')).decode('ascii')
             task_file = "/tmp/openhands_task.txt"
-            write_cmd = f"cat > {task_file} << 'TASKEOF'\n{task}\nTASKEOF"
+            # Decode base64 on container side - safe from shell injection
+            write_cmd = f"echo '{task_b64}' | base64 -d > {task_file}"
             Docker.exec_in_container(name, write_cmd, timeout=10)
             oh_cmd = f"openhands --always-approve -t \"$(cat {task_file})\""
         else:
